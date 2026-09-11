@@ -1,0 +1,3 @@
+# Optional; holds the SM_* overrides (gateway base URL, credentials, secret,
+# published port) read by docker-compose.yaml. Never commit a filled-in one.
+.env

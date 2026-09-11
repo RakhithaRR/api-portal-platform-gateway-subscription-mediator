@@ -1,0 +1,34 @@
+apiVersion: gateway.api-platform.wso2.com/v1
+kind: RestApi
+metadata:
+  name: echo-api-v1
+  annotations:
+    gateway.api-platform.wso2.com/project-id: default
+spec:
+  displayName: Echo API
+  version: v1
+  context: /echo
+  upstream:
+    main:
+      url: https://httpbin.org/anything
+  subscriptionPlans:
+    - iron
+  policies:
+    - name: api-key-auth
+      version: v1
+      params:
+        key: API-Key
+        in: header
+    - name: subscription-validation
+      version: v1
+      params:
+        subscriptionKeyHeader: Subscription-Key
+  operations:
+    - path: /foo
+      method: GET
+    - path: /bar
+      method: POST
+    - path: /baz
+      method: PUT
+    - path: /wee
+      method: DELETE

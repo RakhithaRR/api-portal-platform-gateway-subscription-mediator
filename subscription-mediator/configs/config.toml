@@ -1,0 +1,10 @@
+[webhook]
+secret = ""
+
+[gateway]
+base_url = "http://host.docker.internal:9090/api/management/v1"
+username = ""
+password = ""
+
+[logging]
+level = "info"

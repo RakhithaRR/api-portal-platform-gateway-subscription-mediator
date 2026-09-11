@@ -1,0 +1,93 @@
+openapi: 3.0.1
+info:
+  title: Reading List API
+  version: v1
+  description: |
+    Track a personal reading list — add books, update their reading status, and
+    remove them when you're done. Requires an API key and a subscription token.
+servers:
+  - url: https://localhost:8443/reading-list
+security:
+  - ApiKeyHeader: []
+components:
+  securitySchemes:
+    ApiKeyHeader:
+      type: apiKey
+      in: header
+      name: API-Key
+  parameters:
+    SubscriptionKeyHeader:
+      name: Subscription-Key
+      x-header-type: subscription-key
+      in: header
+      required: true
+      schema:
+        type: string
+  schemas:
+    Book:
+      type: object
+      required: [title, author, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        title:
+          type: string
+          example: The Great Gatsby
+        author:
+          type: string
+          example: F. Scott Fitzgerald
+        status:
+          type: string
+          enum: [to_read, reading, read]
+paths:
+  /books:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionKeyHeader'
+    get:
+      summary: List books
+      responses:
+        '200':
+          description: OK. The reading list.
+    post:
+      summary: Add a book
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Book'
+      responses:
+        '201':
+          description: Created. The newly added book.
+  /books/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionKeyHeader'
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      summary: Get a book
+      responses:
+        '200':
+          description: OK. The requested book.
+    put:
+      summary: Update a book
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Book'
+      responses:
+        '200':
+          description: OK. The updated book.
+    delete:
+      summary: Remove a book
+      responses:
+        '204':
+          description: No Content. The book was removed.

@@ -1,0 +1,17 @@
+# Secrets — never commit a filled-in one.
+.env
+*.env
+!*.env.example
+
+# Local mediator state, if it is ever run outside Docker.
+subscription-mediator/data/
+
+# Build output
+subscription-mediator/bin/
+*.exe
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

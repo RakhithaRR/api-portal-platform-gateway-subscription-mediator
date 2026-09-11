@@ -1,0 +1,74 @@
+# subscription-mediator configuration.
+#
+# Targets WSO2 API Portal 1.0.0 and WSO2 API Platform Gateway 1.2.0, with the
+# gateway's APIs coming from WSO2 API Manager 4.7.0.
+#
+# Mounted read-only into the container at /app/config.toml by
+# docker-compose.yaml. After editing it:
+#
+#   docker compose up -d
+#
+# Every setting below can also be injected as an environment variable, which
+# takes precedence over the value in this file:
+#
+#   [webhook] secret     SM_WEBHOOK_SECRET
+#   [gateway] base_url   SM_GATEWAY_BASE_URL
+#   [gateway] username   SM_GATEWAY_USERNAME
+#   [gateway] password   SM_GATEWAY_PASSWORD
+#   [logging] level      SM_LOG_LEVEL
+#
+# So the two secrets need never be written here at all — put them in a .env file
+# beside docker-compose.yaml instead, and this file can stay as shipped. An empty
+# variable counts as unset. [api_handles] has no environment form; it is a map of
+# arbitrary keys and lives here only.
+#
+# Whichever way you supply them, the required settings are the webhook secret and
+# the gateway credentials: with any of them missing the mediator refuses to start
+# and names what it needs.
+#
+# This file is tracked by git, so take care not to commit your filled-in copy.
+
+[webhook]
+# The secret registered with the API Portal webhook subscriber. It verifies each
+# delivery's signature AND derives the key that decrypts subscription tokens and
+# API key values, so it must match the portal's value exactly.
+#
+#   openssl rand -base64 48
+secret = ""
+
+[gateway]
+# The Gateway Controller management REST API.
+#
+# The mediator runs on its own network and shares none with the gateway, so it
+# reaches it the way anything outside that deployment does — over the host, or
+# over the network for a remote one. The default below suits the common case: the
+# gateway is its own compose stack publishing 9090, and Docker Desktop provides
+# host.docker.internal. Other layouts:
+#
+#   http://172.17.0.1:9090/api/management/v1        Docker Engine on Linux, where
+#                                                   host.docker.internal does not
+#                                                   exist
+#   http://localhost:9090/api/management/v1         mediator run outside Docker
+#   https://gateway.example.com/api/management/v1   gateway in Kubernetes, or any
+#                                                   remote address
+base_url = "http://host.docker.internal:9090/api/management/v1"
+
+# Needs the admin role: every subscription and subscription-plan operation on
+# the management API is admin-scoped.
+username = ""
+password = ""
+
+[logging]
+# debug, info, warn or error.
+level = "info"
+
+# Pin a portal API to a specific gateway API handle, for the cases where
+# matching on display name and version cannot tell which API is meant (a
+# different version string, say: portal "v1.0" against gateway "1.0.0").
+#
+# Keys are matched case-insensitively and may be "<name>:<version>" or the
+# portal's api ref_id. GET /failed names the exact key to add when a resolution
+# fails.
+[api_handles]
+# "order api:v1.0" = "orderapi-1.0.0"
+# "echo api:1.0.0" = "echo-api-1-0-0"

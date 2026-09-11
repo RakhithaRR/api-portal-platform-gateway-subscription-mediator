@@ -1,0 +1,75 @@
+openapi: 3.0.1
+info:
+  title: Echo API
+  version: v1
+  description: |
+    Echo API for testing purposes. Every call requires an API key and a subscription token.
+servers:
+  - url: https://localhost:8443/echo
+security:
+  - ApiKeyHeader: []
+components:
+  securitySchemes:
+    ApiKeyHeader:
+      type: apiKey
+      in: header
+      name: API-Key
+  parameters:
+    SubscriptionKeyHeader:
+      name: Subscription-Key
+      x-header-type: subscription-key
+      in: header
+      required: true
+      schema:
+        type: string
+paths:
+  /foo:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionKeyHeader'
+    get:
+      summary: Echo a message
+      responses:
+        '200':
+          description: OK. The echoed message.
+  /bar:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionKeyHeader'
+    post:
+      summary: Echo a message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message:
+                  type: string
+      responses:
+        '200':
+          description: OK. The echoed message.
+  /baz:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionKeyHeader'
+    put:
+      summary: Echo a message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message:
+                  type: string
+      responses:
+        '200':
+          description: OK. The echoed message.
+  /wee:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionKeyHeader'
+    delete:
+      summary: Echo a message
+      responses:
+        '200':
+          description: OK. The echoed message.

@@ -1,0 +1,33 @@
+apiVersion: api-portal.api-platform.wso2.com/v1
+kind: RestApi
+
+metadata:
+  name: pizza-shack-api-v1
+
+spec:
+  type: REST
+  displayName: Pizza Shack API
+  version: v1
+  description: This is a RESTFul API for Pizza Shack online pizza delivery store.
+  status: PUBLISHED
+  referenceId: pizzashack-api-1-0-0
+
+  tags:
+    - pizza
+
+  labels:
+    - default
+
+  subscriptionPlans:
+    - gold
+
+  agentVisibility: VISIBLE
+  businessInformation:
+    businessOwner: Platform Owner
+    businessOwnerEmail: support@example.com
+    technicalOwner: API Team
+    technicalOwnerEmail: architecture@example.com
+
+  endpoints:
+    sandboxUrl: https://localhost:8443/pizzashack/1.0.0
+    productionUrl: https://localhost:8443/pizzashack/1.0.0

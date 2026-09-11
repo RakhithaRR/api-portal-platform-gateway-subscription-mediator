@@ -1,0 +1,33 @@
+apiVersion: api-portal.api-platform.wso2.com/v1
+kind: RestApi
+
+metadata:
+  name: echo-api-v1
+
+spec:
+  type: REST
+  displayName: Echo API
+  version: v1
+  description: Echo API for testing purposes. Every call requires an API key and a subscription token.
+  status: PUBLISHED
+  referenceId: echo-api-v1
+
+  tags:
+    - echo
+
+  labels:
+    - default
+
+  subscriptionPlans:
+    - iron
+
+  agentVisibility: VISIBLE
+  businessInformation:
+    businessOwner: Platform Owner
+    businessOwnerEmail: support@example.com
+    technicalOwner: API Team
+    technicalOwnerEmail: architecture@example.com
+
+  endpoints:
+    sandboxUrl: https://localhost:8443/echo
+    productionUrl: https://localhost:8443/echo

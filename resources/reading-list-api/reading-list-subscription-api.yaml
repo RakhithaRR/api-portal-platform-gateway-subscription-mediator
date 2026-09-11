@@ -1,0 +1,36 @@
+apiVersion: gateway.api-platform.wso2.com/v1
+kind: RestApi
+metadata:
+  name: reading-list-api-v1
+  annotations:
+    gateway.api-platform.wso2.com/project-id: default
+spec:
+  displayName: Reading List API
+  version: v1
+  context: /reading-list
+  upstream:
+    main:
+      url: https://apis.bijira.dev/samples/reading-list-api-service/v1.0
+  subscriptionPlans:
+    - gold
+  policies:
+    - name: api-key-auth
+      version: v1
+      params:
+        key: API-Key
+        in: header
+    - name: subscription-validation
+      version: v1
+      params:
+        subscriptionKeyHeader: Subscription-Key
+  operations:
+    - method: GET
+      path: /books
+    - method: POST
+      path: /books
+    - method: GET
+      path: /books/{bookId}
+    - method: PUT
+      path: /books/{bookId}
+    - method: DELETE
+      path: /books/{bookId}

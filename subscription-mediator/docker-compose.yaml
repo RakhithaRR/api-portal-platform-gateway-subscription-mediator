@@ -1,0 +1,48 @@
+# subscription-mediator — bridges WSO2 API Portal 1.0.0 webhook events to the
+# WSO2 API Platform Gateway 1.2.0 management REST API, for a gateway whose APIs
+# come from WSO2 API Manager 4.7.0.
+
+name: subscription-mediator
+
+services:
+  subscription-mediator:
+    build:
+      context: .
+    image: subscription-mediator:dev
+    container_name: subscription-mediator
+    restart: on-failure:3
+
+    # Published on all host interfaces so the portal can reach it from another
+    # compose stack, from the host, or from outside the machine. Bind it to
+    # 127.0.0.1 (SM_PUBLISHED_HOST) when only a local portal needs it.
+    ports:
+      - "${SM_PUBLISHED_HOST:-0.0.0.0}:${SM_PUBLISHED_PORT:-8085}:8085"
+
+    # Injected settings, taken from the shell or a .env file beside this one when set.
+    environment:
+      - SM_WEBHOOK_SECRET
+      - SM_GATEWAY_BASE_URL
+      - SM_GATEWAY_USERNAME
+      - SM_GATEWAY_PASSWORD
+      - SM_LOG_LEVEL
+
+    volumes:
+      - ./configs/config.toml:/app/config.toml:ro
+      - mediator-data:/app/data
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8085/health"]
+      interval: 15s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+    networks:
+      - mediator
+
+volumes:
+  mediator-data:
+
+networks:
+  mediator:
+    name: subscription-mediator-network
