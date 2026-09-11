@@ -7,11 +7,11 @@ Part of the [API Portal → API Platform Gateway subscription
 bridge](../README.md), which has the end-to-end walkthrough. This README covers
 the service itself.
 
-| Component | Tested against |
-|---|---|
-| WSO2 API Manager | **4.7.0** |
-| WSO2 API Platform Gateway | **1.2.0** |
-| WSO2 API Portal | **1.0.0** |
+| Component | Tested against | Documentation |
+|---|---|---|
+| WSO2 API Manager | **4.7.0** | [apim.docs.wso2.com](https://apim.docs.wso2.com/en/latest/) |
+| WSO2 API Platform Gateway | **1.2.0** | [API Gateway 1.2.0](https://wso2.com/api-platform/docs/api-gateway/1.2.0/overview/) · [`gateway/v1.2.0`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0) |
+| WSO2 API Portal | **1.0.0** | [API Portal 1.0.0](https://wso2.com/api-platform/docs/api-portal/1.0.0/overview/) · [`api-portal/v1.0.0`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0) |
 
 Both wire contracts it depends on — the portal's webhook envelope and the
 gateway's management REST API — are specific to those versions. Another release
@@ -110,6 +110,8 @@ queued and applied once it answers.
 
 ### Register it with the API Portal
 
+Registering a subscriber has no UI, so it is a `curl` — see
+[Configure webhooks](https://wso2.com/api-platform/docs/api-portal/1.0.0/admin-settings/webhook-integration/).
 Use the **same** `[webhook] secret`. Without a matching secret the portal omits
 the subscription token and API key value from its deliveries entirely, and the
 mediator has nothing to give the gateway.
@@ -138,20 +140,25 @@ docker compose ps
 curl -s localhost:8085/status | jq
 ```
 
-Then subscribe to an API in the portal and confirm it landed:
+Then subscribe to an API in the **API Portal UI** and confirm it landed:
 
 ```bash
 curl -su "<gateway-admin-username>:<gateway-admin-password>" \
   http://localhost:9090/api/management/v1/subscriptions | jq
 ```
 
+Subscribing, generating and revoking keys, suspending a subscription and changing
+its plan are all API Portal UI actions — each publishes a webhook this service
+turns into a gateway call. [`agent-verification.md`](../agent-verification.md)
+exercises every one of them with expected results.
+
 ---
 
 ## Commands
 
 ```bash
-make build     # build the image (docker compose build)
 make test      # run the tests
+make build     # build the image (docker compose build)
 ```
 
 Everything else is plain Compose:
@@ -300,6 +307,12 @@ an `extra_hosts: host.docker.internal:host-gateway` entry, which on Docker
 Desktop *replaces* the working built-in name with the VM's bridge address and
 makes the gateway unreachable.
 
+The **API Platform Gateway 1.2.0 distribution's own`docker-compose.yaml` sets
+that entry**, so on Rancher/Docker Desktop for macOS nothing in the gateway
+stack can reach the host by any Docker name — every one resolves to `172.17.0.1`
+and is refused. That stack needs the machine's LAN IP instead.
+This one deliberately sets no `extra_hosts`, which is why the default above works.
+
 ### Being reached by the portal (inbound)
 
 Port 8085 is published on all host interfaces, so register a `targetUrl` the
@@ -333,7 +346,10 @@ needs to reach it.
 | `application.*`, `apikey.application_updated` | acknowledged, no gateway call — the gateway has no application resource, and the key-to-app link is attribution only |
 
 Plans are matched by name against `GET /subscription-plans` and created when
-missing.
+missing. The portal side of each event is specified in the
+[Webhook Event Catalog](https://wso2.com/api-platform/docs/api-portal/1.0.0/references/webhook-event-catalog/);
+the gateway side is the
+[Gateway Controller Management API](https://wso2.com/api-platform/docs/api-gateway/1.2.0/gateway-controller-management-api/overview/).
 
 **Only `RestApi` artifacts work.** The gateway 1.2.0 subscription and API-key
 endpoints reject every other kind, so an event for `Mcp`, `WebSubApi` etc. is
@@ -434,3 +450,28 @@ The component is standalone: it depends on nothing else in this repository, and
 builds from this directory alone. Its only external dependency is koanf (with
 its TOML parser and env provider) for config loading — everything else is the
 standard library.
+
+---
+
+## References
+
+- [Webhook Event Catalog](https://wso2.com/api-platform/docs/api-portal/1.0.0/references/webhook-event-catalog/)
+  — the delivery envelope, signature header, field decryption and delivery
+  semantics this service implements, and the full event list it handles
+- [Configure webhooks](https://wso2.com/api-platform/docs/api-portal/1.0.0/admin-settings/webhook-integration/)
+  — registering a subscriber, the shared secret, and delivery behaviour
+- [Gateway Controller Management API](https://wso2.com/api-platform/docs/api-gateway/1.2.0/gateway-controller-management-api/overview/)
+  — every call this service makes; see
+  [REST API Management](https://wso2.com/api-platform/docs/api-gateway/1.2.0/gateway-controller-management-api/rest-api-management/)
+  for the REST API, subscription, plan and API-key resources
+- [Policies Overview](https://wso2.com/api-platform/docs/api-gateway/1.2.0/policies/overview/)
+  — `api-key-auth` and `subscription-validation`, the two policies that make a
+  mediated subscription actually enforce anything
+- [Manage Subscriptions](https://wso2.com/api-platform/docs/api-portal/1.0.0/consume-an-api/manage-subscriptions/)
+  and [Manage API Keys](https://wso2.com/api-platform/docs/api-portal/1.0.0/consume-an-api/manage-api-keys/)
+  — the portal actions that produce the events
+- [Getting Started with Platform Gateway](https://apim.docs.wso2.com/en/latest/api-gateway/platform-gateway/getting-started/)
+  — attaching the gateway to WSO2 API Manager 4.7.0, the setup this exists for
+- Distributions: [`gateway/v1.2.0`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0) ·
+  [`api-portal/v1.0.0`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0) ·
+  [all releases](https://github.com/wso2/api-platform/releases)

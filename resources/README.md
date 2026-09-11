@@ -1,9 +1,14 @@
 # Sample APIs
 
-The three APIs used by the [walkthrough](../README.md). Written for **WSO2 API
-Manager 4.7.0**, **WSO2 API Platform Gateway 1.2.0** and **WSO2 API Portal
-1.0.0** — the `apiVersion` at the top of each file is that release's schema, so
-these won't load unchanged into another version.
+The three APIs used by the [walkthrough](../README.md). Written for **WSO2 API Manager 4.7.0**
+([docs](https://apim.docs.wso2.com/en/latest/)), **WSO2 API Platform Gateway
+1.2.0** ([docs](https://wso2.com/api-platform/docs/api-gateway/1.2.0/overview/) ·
+[`gateway/v1.2.0`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0))
+and **WSO2 API Portal 1.0.0**
+([docs](https://wso2.com/api-platform/docs/api-portal/1.0.0/overview/) ·
+[`api-portal/v1.0.0`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0))
+— the `apiVersion` at the top of each file is that release's schema, so these
+won't load unchanged into another version.
 
 | API | Path | Plan | Reaches the gateway by |
 |---|---|---|---|
@@ -43,3 +48,15 @@ last part matters.
 
 `api.yaml` points both `productionUrl` and `sandboxUrl` at
 `https://localhost:8443/...`. Change the host if your gateway isn't local.
+
+## References
+
+- [REST API Management](https://wso2.com/api-platform/docs/api-gateway/1.2.0/gateway-controller-management-api/rest-api-management/)
+  — the endpoint the `*-subscription-api.yaml` files are posted to, and the
+  `RestApi` schema they follow
+- [Policies Overview](https://wso2.com/api-platform/docs/api-gateway/1.2.0/policies/overview/)
+  — the `api-key-auth` and `subscription-validation` entries under `spec.policies`
+- [Subscription Plans](https://wso2.com/api-platform/docs/api-portal/1.0.0/admin-settings/subscription-plans/)
+  — what `spec.subscriptionPlans` refers to on the portal side
+- [Secured API End to End](https://wso2.com/api-platform/docs/api-portal/1.0.0/tutorials/secured-api-end-to-end/)
+  — the official tutorial these samples mirror

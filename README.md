@@ -15,11 +15,11 @@ the end-to-end walkthrough to set it up from scratch.
 Everything here was built and tested against exactly these versions, and nothing
 else:
 
-| Component | Version |
-|---|---|
-| WSO2 API Manager | **4.7.0** |
-| WSO2 API Platform Gateway | **1.2.0** |
-| WSO2 API Portal | **1.0.0** |
+| Component | Version | Documentation | Distribution |
+|---|---|---|---|
+| WSO2 API Manager | **4.7.0** | [apim.docs.wso2.com](https://apim.docs.wso2.com/en/latest/) | — |
+| WSO2 API Platform Gateway | **1.2.0** | [API Gateway 1.2.0](https://wso2.com/api-platform/docs/api-gateway/1.2.0/overview/) | [`gateway/v1.2.0`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0) |
+| WSO2 API Portal | **1.0.0** | [API Portal & MCP Hub 1.0.0](https://wso2.com/api-platform/docs/api-portal/1.0.0/overview/) | [`api-portal/v1.0.0`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0) |
 
 These products move quickly and their REST APIs are versioned independently of
 the products themselves, so treat another combination as untested — the
@@ -66,6 +66,8 @@ replays them onto the gateway's management REST API.
 ## What's in here
 
 ```
+agent-verification.md       an end-to-end test script for a coding agent —
+                            every subscription and API-key operation, asserted
 subscription-mediator/      the bridge itself — Go, runs in Docker
                             (see its own README for internals and operations)
 resources/                  the sample APIs (see resources/README.md)
@@ -93,12 +95,35 @@ Echo and Reading List are created on the gateway and sync *up* to API Manager
 The three products at the versions in the table above:
 
 - **WSO2 API Manager 4.7.0**
-- **WSO2 API Platform Gateway 1.2.0** — follow
-  [Getting started](https://apim.docs.wso2.com/en/latest/api-gateway/platform-gateway/getting-started/)
-- **WSO2 API Portal 1.0.0** — follow
-  [Secured API end to end](https://wso2.com/api-platform/docs/api-portal/1.0.0/tutorials/secured-api-end-to-end/)
+- **WSO2 API Platform Gateway 1.2.0** —
+  [`wso2apip-api-gateway-1.2.0.zip`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0);
+  setup steps in
+  [Getting Started with Platform Gateway](https://apim.docs.wso2.com/en/latest/api-gateway/platform-gateway/getting-started/)
+- **WSO2 API Portal 1.0.0** —
+  [`wso2apip-api-portal-1.0.0.zip`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0);
+  setup steps in
+  [Secured API End to End](https://wso2.com/api-platform/docs/api-portal/1.0.0/tutorials/secured-api-end-to-end/)
+
+Both distributions unzip with their own `README.md` and a one-time
+`scripts/setup.sh`; run that before the first `docker compose up`.
 
 Plus Docker with Compose v2, `curl`, `jq` and `openssl`.
+
+**API Manager 4.7.0 needs JDK 21 or later** — its start script passes
+`--enable-native-access=ALL-UNNAMED`, which JDK 11 rejects outright with
+`Could not create the Java Virtual Machine`. Set `JAVA_HOME` to a 21+ JDK before
+`./bin/api-manager.sh`.
+
+This walkthrough runs API Manager with **port offset 1** (so `9444`, leaving
+`9443` free). Set it once in `repository/conf/deployment.toml` before the first
+start:
+
+```toml
+[server]
+offset = 1
+```
+
+With the default offset 0, use `9443` everywhere `9444` appears below.
 
 Set these once; every command below uses them.
 
@@ -117,7 +142,20 @@ export GW_URL=https://localhost:8443
 export PORTAL_USER=<portal-admin-username>
 export PORTAL_PASS=<portal-admin-password>
 export PORTAL=https://localhost:9543/api-portal/api/v0.9
+
+# The address containers use to reach services on this machine (see below)
+export HOST_ADDR=$(ipconfig getifaddr en0)      # macOS
+# export HOST_ADDR=172.17.0.1                   # Docker Engine on Linux
 ```
+
+> **`host.docker.internal` does not work from the gateway container.** The
+> gateway 1.2.0 `docker-compose.yaml` sets
+> `extra_hosts: ["host.docker.internal:host-gateway"]`, which on **Docker Desktop
+> for macOS** *replaces* the working built-in name with the Linux bridge address
+> `172.17.0.1` — unreachable there, so every connection out to the host is
+> refused. Use the machine's own LAN IP (`$HOST_ADDR`) for anything the
+> **gateway** must reach on the host. The portal and the mediator don't set
+> `extra_hosts`, so `host.docker.internal` works normally for them.
 
 The gateway's management API is HTTP basic auth and its subscription and
 subscription-plan operations are **admin-scoped**, so `$GW_USER` needs the admin
@@ -135,17 +173,29 @@ Add the supported gateway versions to API Manager 4.7.0's
 versions = ["1.0.0", "1.1.0", "1.2.0"]
 ```
 
-Start API Manager, then add a gateway under **Admin → Gateways**. The version
-must be the one you are actually running — `1.2.0` throughout this walkthrough:
+Start API Manager and open the **Admin Portal** at
+<https://localhost:9444/admin>. Go to **Gateways → Add Gateway**, choose the
+**API Platform Gateway** type, and fill in
+(see [Getting Started with Platform Gateway](https://apim.docs.wso2.com/en/latest/api-gateway/platform-gateway/getting-started/)):
 
 | Field | Value |
 |---|---|
-| Name | `Dev Platform Gateway` |
+| Name | `dev-platform-gateway` |
+| Display Name | `Dev Platform Gateway` |
 | URL | `https://localhost:8443` |
 | Version | `1.2.0` |
+| Visibility | Public |
 
-Note the **label** API Manager assigns it (`dev-platform-gateway` here) — the
-gateway has to be told its own name.
+**Name** must be lowercase letters, digits and hyphens (3–64 characters). It is
+the gateway's identity, and you give it back to the gateway as
+`APIP_GW_CONTROLLER_CONTROLPLANE_GATEWAY_NAME` in step 3.
+
+On save, the Admin Portal shows a **registration token once**. Copy it now — it
+is stored only as a hash and can never be displayed again, only regenerated from
+the gateway's row.
+
+> If you don't see an API Platform Gateway option, the `[apim.platform_gateway]`
+> block above wasn't picked up — check it and restart API Manager.
 
 ## 2. Register a DCR application
 
@@ -153,7 +203,7 @@ The gateway needs an OAuth2 client to push artifacts back up to API Manager
 (the DP→CP direction).
 
 ```bash
-curl -k -X POST https://localhost:9444/client-registration/v0.17/register \
+curl -sk -X POST "$APIM/client-registration/v0.17/register" \
   -u "$APIM_USER:$APIM_PASS" \
   -H "Content-Type: application/json" \
   -d '{
@@ -162,11 +212,23 @@ curl -k -X POST https://localhost:9444/client-registration/v0.17/register \
     "owner": "'"$APIM_USER"'",
     "grantType": "password refresh_token client_credentials",
     "saasApp": true
-  }'
+  }' | jq
 ```
 
 The response carries `clientId` and `clientSecret`. Keep them out of version
-control.
+control, then exchange them for the admin token the steps above and below use:
+
+```bash
+export CID=<clientId>
+export CSEC=<clientSecret>
+export APIM_TOKEN=$(curl -sk -X POST "$APIM/oauth2/token" -u "$CID:$CSEC" \
+  -d "grant_type=password&username=$APIM_USER&password=$APIM_PASS&scope=apim:admin%20apim:api_view%20apim:api_create%20apim:api_publish%20apim:api_manage" \
+  | jq -r .access_token)
+```
+
+`$APIM_TOKEN` isn't needed for the walkthrough itself — the Publisher and Admin
+portals handle their own sessions — but it's what the verification commands and
+[`agent-verification.md`](agent-verification.md) use.
 
 ## 3. Configure and start the gateway
 
@@ -175,14 +237,28 @@ Gateway** in the API Manager UI:
 
 | Variable | Value |
 |---|---|
-| `APIP_GW_CONTROLLER_CONTROLPLANE_HOST` | from the UI |
-| `APIP_GW_CONTROLLER_CONTROLPLANE_TOKEN` | from the UI |
-| `APIP_GW_CONTROLLER_CONTROLPLANE_GATEWAY_NAME` | the gateway's label, e.g. `dev-platform-gateway` |
+| `APIP_GW_CONTROLLER_CONTROLPLANE_HOST` | `$HOST_ADDR:9444` — **not** `host.docker.internal` |
+| `APIP_GW_CONTROLLER_CONTROLPLANE_TOKEN` | the registration token from step 1 |
+| `APIP_GW_CONTROLLER_CONTROLPLANE_GATEWAY_NAME` | the gateway's `name`, e.g. `dev-platform-gateway` |
+| `APIP_GW_CONTROLLER_CONTROLPLANE_INSECURE_SKIP_VERIFY` | `true` (API Manager's TLS cert is self-signed) |
 | `GATEWAY_CONTROLPLANE_ON_PREM` | `true` |
 | `APIP_GW_CONTROLLER_CONTROLPLANE_APIM_OAUTH2_CLIENT_ID` | `clientId` from step 2 |
 | `APIP_GW_CONTROLLER_CONTROLPLANE_APIM_OAUTH2_CLIENT_SECRET` | `clientSecret` from step 2 |
 
-Start the gateway, and confirm the management API answers:
+Reference:
+[Control Plane Connection](https://wso2.com/api-platform/docs/api-gateway/1.2.0/deployment/production-deployment/control-plane-connection/)
+and the distribution's own `README.md` ("Connecting to WSO2 API Platform").
+
+Append them to `api-platform.env` (created by `./scripts/setup.sh`), then
+`docker compose up -d`. A connected gateway logs:
+
+```
+msg="Control plane connection established" gateway_id=... connection_id=...
+```
+
+and the Admin Portal's Gateways page flips the gateway to **Active**.
+
+Confirm the management API answers:
 
 ```bash
 curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/rest-apis" | jq '.apis | length'
@@ -214,6 +290,10 @@ curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/subscription-plans" | jq
 > plane skips rate limiting for that plan entirely. `throttleLimitUnit` is one of
 > `Min`, `Hour`, `Day`, `Month` — exactly those, case-sensitive.
 
+The full schema is in the gateway's own
+`gateway-controller/api/management-openapi.yaml`, documented at
+[Gateway Controller Management API](https://wso2.com/api-platform/docs/api-gateway/1.2.0/gateway-controller-management-api/overview/).
+
 We deliberately *don't* create `iron` here. Step 10 shows what happens when a
 plan reaches the gateway only through a subscription event.
 
@@ -241,6 +321,11 @@ policies:
     params: { subscriptionKeyHeader: Subscription-Key }
 ```
 
+See [Policies Overview](https://wso2.com/api-platform/docs/api-gateway/1.2.0/policies/overview/)
+for how policies are declared and ordered, and
+[REST API Management](https://wso2.com/api-platform/docs/api-gateway/1.2.0/gateway-controller-management-api/rest-api-management/)
+for this endpoint.
+
 List what's deployed, and delete one by its handle if you need to start over:
 
 ```bash
@@ -259,26 +344,87 @@ curl -k "$GW_URL/echo/foo"
 
 ## 6. Create an API in API Manager and deploy it (CP→DP)
 
-For the other direction, create an API in the API Manager publisher — Pizza Shack
-is the stock sample — with **API key authentication** and **subscription
-validation** enabled, and deploy it to `Dev Platform Gateway`.
+Everything in this step happens in the **Publisher Portal** at
+<https://localhost:9444/publisher>.
 
-Then find the handle the gateway gave it:
+### Create the API
+
+**Create API → REST API → Import Open API**, upload
+`resources/pizza-shack-api/definition.yaml`, and set:
+
+| Field | Value |
+|---|---|
+| Name | `PizzaShack API` |
+| Context | `/pizzashack` |
+| Version | `1.0.0` |
+| Endpoint | `https://<your-host>:9444/am/sample/pizzashack/v1/api` |
+| Gateway | **Dev Platform Gateway** |
+
+The endpoint has to be reachable **from the router container**, so use the host
+address rather than `localhost`.
+
+### Secure it from the Policies page
+
+A platform-gateway API is **not** secured through **Runtime Configuration → API
+Security**. That page drives `securityScheme`, a Synapse-gateway concept: API
+Manager accepts it and leaves it unchanged for a platform-gateway API, and
+nothing reaches the gateway from it.
+
+Security comes from **policies** instead. Open the API's **Policies** tab and
+drag both onto the **Request** flow, at API level:
+
+| Policy | Parameters |
+|---|---|
+| **API Key Auth** | `key` = `API-Key`, `in` = `header` |
+| **Subscription Validation** | `subscriptionKeyHeader` = `Subscription-Key` |
+
+These are the same two policies the step 5 YAML declares. Save.
+
+> The Policies page for a platform-gateway API reads the **Policy Hub**, a remote
+> catalogue (`app.policyHub.endpoint` in the Publisher's `settings.json`). It
+> needs outbound internet access from your browser — with none, the palette is
+> empty and there is nothing to drag.
+
+### Deploy and publish
+
+**Deploy → Deploy New Revision**, pick `Dev Platform Gateway`, deploy. Then
+**Lifecycle → Publish**.
+
+Policies only reach the gateway with a deployment, so **any later policy change
+needs a new revision deployed** — saving alone changes nothing on the gateway.
+
+### Confirm what landed
 
 ```bash
 curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/rest-apis" | jq '.apis[].metadata.name'
 # ... "pizzashack-api-1-0-0"
+
+curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/rest-apis/pizzashack-api-1-0-0" \
+  | jq '.spec.policies[].name'
+# "api-key-auth"
+# "subscription-validation"
 ```
 
-That handle is what goes in `spec.referenceId` of the portal's `api.yaml` —
-`resources/pizza-shack-api/api.yaml` already has it. **This is the one field that
-has to match by hand**; see [How an API is matched](#how-an-api-is-matched)
-below.
+That handle — `pizzashack-api-1-0-0` — is what goes in `spec.referenceId` of the
+portal's `api.yaml`, and `resources/pizza-shack-api/api.yaml` already has it.
+**This is the one field you must match by hand**; see
+[How an API is matched](#how-an-api-is-matched).
 
 ```bash
 curl -k "$GW_URL/pizzashack/1.0.0/menu"
 # {"error":"Unauthorized","message":"Valid API key required"}
 ```
+
+If instead the call is proxied straight through, the policies didn't reach the
+gateway — re-check the `jq '.spec.policies'` output, and that you deployed a new
+revision after saving them.
+
+> A backend on a self-signed certificate (API Manager's own sample backend is)
+> gives `503` with `CERTIFICATE_VERIFY_FAILED` in the router log *after* auth
+> passes — the policies are working; the gateway just doesn't trust the backend.
+> Register its CA through the controller's `POST /certificates` +
+> `POST /certificates/reload`. Dropping a PEM into `resources/certificates/` is
+> not enough: that directory is mounted into the controller, not the router.
 
 ## 7. Start the subscription mediator
 
@@ -352,10 +498,19 @@ if it's elsewhere.
 > encrypts the subscription token and API key inside it. If it doesn't match, the
 > mediator rejects the delivery — and the portal never retries.
 
+References:
+[Configure webhooks](https://wso2.com/api-platform/docs/api-portal/1.0.0/admin-settings/webhook-integration/)
+for subscriber registration and delivery behaviour, and the
+[Webhook Event Catalog](https://wso2.com/api-platform/docs/api-portal/1.0.0/references/webhook-event-catalog/)
+for the envelope, headers, signature verification, field decryption and the full
+`subscription.*` / `apikey.*` / `application.*` event list.
+
 ### Mirror the subscription plans
 
-The portal has its own plans. Give them the same names as the gateway's, since
-that's what the mediator matches on.
+The portal has its own plans (see
+[Subscription Plans](https://wso2.com/api-platform/docs/api-portal/1.0.0/admin-settings/subscription-plans/)).
+Give them the same names as the gateway's, since that's what the mediator matches
+on.
 
 ```bash
 # gold — mirrors the plan created in step 4
@@ -378,6 +533,10 @@ curl -sk "$PORTAL/subscription-plans" -H "Authorization: Bearer $TOKEN" | jq
 
 ### Publish the APIs to the portal
 
+These three uploads are the portal's content-import API — there is no UI
+equivalent, so they stay as `curl`. Everything a *consumer* does (subscribing,
+keys) is the portal UI, in step 9.
+
 ```bash
 for api in echo-api reading-list-api pizza-shack-api; do
   curl -sk -X POST "$PORTAL/apis" \
@@ -397,11 +556,25 @@ curl -sk -X DELETE "$PORTAL/apis/pizza-shack-api-v1" -H "Authorization: Bearer $
 
 ## 9. Subscribe and invoke
 
-In the portal UI, subscribe an application to an API and generate both
-credentials — see
-[Get both credentials in the portal](https://wso2.com/api-platform/docs/api-portal/1.0.0/tutorials/secured-api-end-to-end/#step-6-get-both-credentials-in-the-portal).
+Everything in this step happens in the **API Portal** at
+<https://localhost:9543/api-portal/default/views/default>, signed in with the
+admin credentials `setup.sh` printed.
 
-Each action fires a webhook the mediator applies within a second or two. Watch it
+1. Open **Reading List API** and click **Subscribe**.
+2. Pick the **Gold** plan and confirm. The portal shows the **subscription key**
+   — copy it.
+3. On the same API, go to **API Keys → Generate Key**, give it a name, and copy
+   the **API key**. Both values are shown once and never stored in plaintext.
+
+Full UI reference:
+[Manage Subscriptions](https://wso2.com/api-platform/docs/api-portal/1.0.0/consume-an-api/manage-subscriptions/)
+(subscribe, switch plan, cancel) and
+[Manage API Keys](https://wso2.com/api-platform/docs/api-portal/1.0.0/consume-an-api/manage-api-keys/)
+(generate, rotate, revoke). This walkthrough mirrors
+[Secured API End to End](https://wso2.com/api-platform/docs/api-portal/1.0.0/tutorials/secured-api-end-to-end/)
+step 6, with the mediator standing in for the Platform API connection.
+
+Each action fires a webhook the mediator applies within a few seconds. Watch it
 land:
 
 ```bash
@@ -409,26 +582,45 @@ curl -s localhost:8085/status | jq
 curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/subscriptions" | jq
 ```
 
-Then call the APIs with both headers:
+`applied` should climb by one per action and `failed` stay at `0`. The mediator
+log names what it did:
+
+```
+msg="resolved portal API to gateway API" portal_api="Reading List API v1" gateway_api_handle=reading-list-api-v1
+msg="created a gateway subscription" ... gateway_plan_id=... status=ACTIVE
+msg="injected the portal API key into the gateway" ... gateway_key_name=...
+```
+
+Then call the API with both headers:
 
 ```bash
 curl -k "$GW_URL/reading-list/books" \
   -H "API-Key: <api-key-from-the-portal>" \
   -H "Subscription-Key: <subscription-key-from-the-portal>"
-
-curl -k "$GW_URL/echo/foo" \
-  -H "API-Key: <api-key-from-the-portal>" \
-  -H "Subscription-Key: <subscription-key-from-the-portal>"
-
-curl -k "$GW_URL/pizzashack/1.0.0/menu" \
-  -H "API-Key: <api-key-from-the-portal>" \
-  -H "Subscription-Key: <subscription-key-from-the-portal>"
 ```
+
+Repeat the subscribe-and-generate for **Echo API** (plan **Iron**) and **Pizza
+Shack API** (plan **Gold**) and call those too:
+
+```bash
+curl -k "$GW_URL/echo/foo"             -H "API-Key: ..." -H "Subscription-Key: ..."
+curl -k "$GW_URL/pizzashack/1.0.0/menu" -H "API-Key: ..." -H "Subscription-Key: ..."
+```
+
+Dropping either header shows which policy is doing what — no API key is `401`
+from `api-key-auth`, a valid key with no subscription key is `403` from
+`subscription-validation`.
+
+The portal is also where you **regenerate** or **revoke** an API key, **suspend**
+or **resume** a subscription, **change its plan**, and **regenerate** the
+subscription token. Each is one more webhook, and the mediator applies it to the
+gateway the same way. `agent-verification.md` walks every one of them with
+expected results.
 
 ## 10. Make the rate limit actually apply
 
-Subscribe something to **Echo API**, which uses the `iron` plan that only ever
-existed in the portal. The call succeeds — but it is never throttled.
+In the portal, subscribe to **Echo API** on the **Iron** plan — a plan that only
+ever existed in the portal. The call succeeds, but it is never throttled.
 
 The reason: the portal's webhook payload carries a plan's `ref_id` and `name`,
 **not its limits**. So when the mediator meets a plan the gateway doesn't have,
@@ -467,11 +659,40 @@ done
 # 200 200 200 200 200 200 200 200 200 200 429 429
 ```
 
+The counter is per policy-engine process and the window is fixed, not sliding —
+so N replicas give roughly N× the limit, and a burst can straddle a boundary.
+
 **Creating each plan on the gateway with its limits before anyone subscribes**
 (as `gold` was in step 4) avoids this entirely — the mediator binds to an
 existing plan by name rather than creating a limitless one.
 
 ---
+
+## Restarting the gateway revokes every portal-issued API key
+
+When the gateway is attached to API Manager as its control plane, it runs an API
+key sync on every startup and **revokes each key API Manager doesn't know about**
+— which is all of them, since the portal issued them and the mediator injected
+them straight into the gateway:
+
+```
+msg="Starting API key sync at gateway startup"
+msg="Processing API key revoke event" api_id=...
+msg="Revoking API key" api_id=... api_key=persist-test-key
+```
+
+Verified: a key that returned `200` immediately before a
+`docker compose restart gateway-controller` returns `401` after it, and
+`GET /rest-apis/{api}/api-keys` drops to `0`.
+
+**Subscriptions are not affected** — they survive the restart intact. Only API
+keys are lost.
+
+There is nothing for the mediator to retry: those events succeeded, and the
+revocation happened afterwards on the gateway side, so `/failed` stays empty and
+`/failed/requeue` is a no-op. Recover by generating a fresh key in the portal,
+which fires a new `apikey.generated` the mediator applies. Plan around it: avoid
+restarting the gateway mid-demo, and re-issue keys after any restart.
 
 ## How an API is matched
 
@@ -501,11 +722,51 @@ resolves, `GET /failed` on the mediator names the exact line to add.
 | Calls succeed but are never throttled | the gateway plan has no `throttleLimitCount`/`throttleLimitUnit` — see step 10 |
 | `no gateway REST API matches portal API ...` | name/version mismatch. Pin it under `[api_handles]`, restart, requeue |
 | Mediator container `Exited` right after start | a required setting is missing; the reason is its last log line |
+| Gateway logs `WebSocket connection failed ... dial tcp 172.17.0.1:9444: connect: connection refused` | the `extra_hosts` trap — point `APIP_GW_CONTROLLER_CONTROLPLANE_HOST` at `$HOST_ADDR`, not `host.docker.internal` |
+| A CP-created API answers without credentials | its policies aren't attached, or weren't redeployed — see step 6; **API Security / `securityScheme` does nothing** for a platform-gateway API |
+| The publisher's Policies page is empty for a platform-gateway API | it reads the remote Policy Hub — that host must be reachable from the browser |
+| Every API key returns `401` after a gateway restart | the startup API key sync revoked them; re-issue from the portal (see above) |
+| `503` with `CERTIFICATE_VERIFY_FAILED` once auth passes | the backend's CA isn't in the gateway's `resources/certificates/` |
+| APIM won't start: `Unrecognized option: --enable-native-access` | JDK 11 on `JAVA_HOME`; 4.7.0 needs 17+ |
 
 The API Portal **attempts each delivery exactly once** — there is no retry and no
 dead-letter queue on its side. Anything the mediator rejects is marked `FAILED`
 in the portal and never resent, which is why the mediator persists every accepted
 event before acknowledging it, and why `/failed/requeue` exists.
+
+## References
+
+Official documentation for the exact versions this was built against.
+
+**WSO2 API Manager 4.7.0**
+
+- [Documentation home](https://apim.docs.wso2.com/en/latest/)
+- [Getting Started with Platform Gateway](https://apim.docs.wso2.com/en/latest/api-gateway/platform-gateway/getting-started/)
+  — registering the gateway in the Admin Portal, then configuring and starting it
+
+**WSO2 API Platform Gateway 1.2.0** — [`gateway/v1.2.0`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0)
+
+- [Overview](https://wso2.com/api-platform/docs/api-gateway/1.2.0/overview/)
+- [Control Plane Connection](https://wso2.com/api-platform/docs/api-gateway/1.2.0/deployment/production-deployment/control-plane-connection/)
+- [Gateway Controller Management API](https://wso2.com/api-platform/docs/api-gateway/1.2.0/gateway-controller-management-api/overview/)
+  and [REST API Management](https://wso2.com/api-platform/docs/api-gateway/1.2.0/gateway-controller-management-api/rest-api-management/)
+- [Policies Overview](https://wso2.com/api-platform/docs/api-gateway/1.2.0/policies/overview/)
+
+**WSO2 API Portal & MCP Hub 1.0.0** — [`api-portal/v1.0.0`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0)
+
+- [Overview](https://wso2.com/api-platform/docs/api-portal/1.0.0/overview/)
+- [Secured API End to End](https://wso2.com/api-platform/docs/api-portal/1.0.0/tutorials/secured-api-end-to-end/)
+  — the tutorial this walkthrough parallels
+- [Configure webhooks](https://wso2.com/api-platform/docs/api-portal/1.0.0/admin-settings/webhook-integration/)
+  and the [Webhook Event Catalog](https://wso2.com/api-platform/docs/api-portal/1.0.0/references/webhook-event-catalog/)
+  — the contract this whole project consumes
+- [Subscription Plans](https://wso2.com/api-platform/docs/api-portal/1.0.0/admin-settings/subscription-plans/)
+- [Manage Subscriptions](https://wso2.com/api-platform/docs/api-portal/1.0.0/consume-an-api/manage-subscriptions/)
+  and [Manage API Keys](https://wso2.com/api-platform/docs/api-portal/1.0.0/consume-an-api/manage-api-keys/)
+
+**Distributions** — [all releases](https://github.com/wso2/api-platform/releases).
+Each `wso2apip-*.zip` carries its own `README.md`, which is the authority on that
+build's ports, `scripts/setup.sh` flags and `configs/config-template.toml`.
 
 ## Notes
 
@@ -520,3 +781,8 @@ event before acknowledging it, and why `/failed/requeue` exists.
 - Full operational detail — configuration precedence, networking matrix,
   per-event behaviour, retries, state — is in
   [`subscription-mediator/README.md`](subscription-mediator/README.md).
+- [`agent-verification.md`](agent-verification.md) drives the same flow entirely
+  over REST, with expected results for every subscription and API-key operation
+  — key generation, regeneration and revocation, subscription suspension,
+  resumption, plan change, token regeneration and deletion, plus a cross-API
+  isolation matrix. It's meant for a coding agent to execute and report on.
