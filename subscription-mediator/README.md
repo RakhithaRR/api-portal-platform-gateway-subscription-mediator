@@ -346,7 +346,17 @@ needs to reach it.
 | `application.*`, `apikey.application_updated` | acknowledged, no gateway call — the gateway has no application resource, and the key-to-app link is attribution only |
 
 Plans are matched by name against `GET /subscription-plans` and created when
-missing. The portal side of each event is specified in the
+missing. A gateway API may also carry its own `spec.subscriptionPlans`
+allowlist, and the gateway rejects a subscription whose plan is not on it — so
+when the target plan is absent from the allowlist, the subscription is created
+or recreated **without a plan** rather than not at all. That keeps access
+working, at the cost of the plan's rate limit, so the decision is never taken on
+a cached reading: the allowlist is cached for five minutes and an operator can
+widen it on the gateway with no event to announce the change, so a plan that
+looks disabled is confirmed against a fresh `GET /rest-apis` first. A widened
+allowlist therefore takes effect on the next event, not five minutes later.
+
+The portal side of each event is specified in the
 [Webhook Event Catalog](https://wso2.com/api-platform/docs/api-portal/1.0.0/references/webhook-event-catalog/);
 the gateway side is the
 [Gateway Controller Management API](https://wso2.com/api-platform/docs/api-gateway/1.2.0/gateway-controller-management-api/overview/).

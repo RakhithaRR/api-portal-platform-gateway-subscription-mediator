@@ -392,9 +392,20 @@ curl -sk -X POST "$PORTAL/webhook-subscribers" -H "Authorization: Bearer $TOKEN"
        \"targetUrl\":\"http://host.docker.internal:8085/devportal/events\",
        \"secret\":\"$WEBHOOK_SECRET\",
        \"events\":[\"apikey.*\",\"subscription.*\"],
-       \"enabled\":true}" -o /dev/null -w '%{http_code}\n'
+       \"enabled\":true,
+       \"timeoutMs\":15000}" -o /dev/null -w '%{http_code}\n'
 # 201
 ```
+
+> **Set `timeoutMs` explicitly; the default of 5000 is too tight here.** The
+> portal attempts each delivery **once** — there is no retry and no redelivery
+> endpoint — so a single slow response loses the event permanently. The
+> mediator's first connection after several idle minutes can exceed 5 s through
+> Docker Desktop's `host.docker.internal`, which is enough to drop it. A run of
+> this document did exactly that: one `subscription.plan_changed` was recorded
+> `status: FAILED, lastError: "timeout"` and never arrived, and because the
+> mediator never received it, `failed`/`failedFinal` stayed `0` and `/failed`
+> stayed empty. See the delivery check at the end of Phase 11.
 
 `targetUrl` has to be resolvable **from wherever the portal runs** — use
 `localhost:8085` if the portal is on the host, or the machine's routable address
@@ -812,6 +823,23 @@ curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/subscriptions" \
 
 **Expected:** the subscription now carries a plan id.
 
+> **No wait is needed between the gateway `PUT` and the plan change**, even
+> though the mediator caches each API's plan allowlist for `APICacheTTL`
+> (5 minutes). Nothing on the portal side announces a gateway-side change, so
+> before dropping a plan as not-allowed the mediator re-reads the allowlist from
+> the gateway and decides on that; the cached copy alone never costs a
+> subscription its rate limit. When the cached reading was stale it says so:
+>
+> ```
+> msg="the plan is enabled for this gateway API on a fresh read; the cached allowlist was stale" plan_name=Iron
+> ```
+>
+> A `(none)` here, with
+> `msg="the new plan is not enabled for this gateway API; recreating without a plan"`,
+> means the `PUT` above did not land — check
+> `GET $GW_MGMT/rest-apis/reading-list-api-v1 | jq .spec.subscriptionPlans`
+> actually reads `["gold","iron"]`.
+
 The `iron` plan the mediator auto-created has **no limits**, so give it some —
 this is the gap the walkthrough's step 10 is about:
 
@@ -1097,6 +1125,31 @@ curl -s localhost:8085/failed | jq '.count'
 **Expected:** `failed` and `failedFinal` both `0`, `/failed` empty. Any entry
 there carries the reason and the exact `[api_handles]` line to add if it was a
 resolution failure.
+
+### The portal's delivery log must be clean too
+
+A clean mediator queue is **not** sufficient. The mediator's counters only cover
+events it received; an event the portal failed to deliver leaves no trace in
+them at all. Ask the portal:
+
+```bash
+curl -sk "$PORTAL/webhook-subscribers/subscription-mediator/deliveries" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq -r '[.list[] | select(.status != "DELIVERED")]
+           | "not delivered: \(length)", (.[] | "  \(.occurredAt) \(.eventType) \(.status) \(.lastError)")'
+# not delivered: 0
+```
+
+**Expected:** `not delivered: 0`. A `FAILED` row is a **lost portal action** —
+the gateway is out of sync with the portal and nothing will reconcile it on its
+own. The portal delivers each event once, with no retry and no redelivery
+endpoint (`/redeliver` and `/retry` both answer `404`), so recovery is to redo
+the portal action that produced it. If the row's `lastError` is `timeout`, raise
+the subscriber's `timeoutMs` (S9) before re-running.
+
+Note this endpoint takes no query parameters — `?limit=100` is rejected with
+`400 Unknown query parameter 'limit'`; it returns the most recent 20 with a
+`pagination` object.
 
 ---
 

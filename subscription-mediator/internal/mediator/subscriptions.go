@@ -40,10 +40,13 @@ func (m *Mediator) handleSubscriptionCreated(ctx context.Context, env *webhook.E
 	// rejects a subscription whose plan is not on it. Dropping the plan keeps the
 	// subscription working on default limits instead of failing the event.
 	planName := data.Plan.Display()
-	if planID != "" && planName != "" && !planEnabledForAPI(resolved, planName) {
-		log.Warn("the plan is not enabled for this gateway API; creating the subscription without a plan",
-			slog.String("plan_name", planName), slog.String("gateway_api_handle", resolved.handle))
-		planID = ""
+	if planID != "" && planName != "" {
+		var allowed bool
+		if resolved, allowed = m.planAllowed(ctx, resolved, planName, log); !allowed {
+			log.Warn("the plan is not enabled for this gateway API; creating the subscription without a plan",
+				slog.String("plan_name", planName), slog.String("gateway_api_handle", resolved.handle))
+			planID = ""
+		}
 	}
 
 	status := normalizeStatus(data.Status)
@@ -87,6 +90,45 @@ func (m *Mediator) handleSubscriptionCreated(ctx context.Context, env *webhook.E
 		slog.String("gateway_plan_id", req.SubscriptionPlanID),
 		slog.String("status", status))
 	return nil
+}
+
+// planAllowed reports whether planName is on the gateway API's plan allowlist,
+// and returns the resolution the answer was read from.
+//
+// A negative is confirmed against a fresh read of the API. The allowlist is
+// cached for APICacheTTL and nothing on the portal side announces a change to
+// it, so a plan an operator enabled on the gateway moments ago can still look
+// disabled here. Acting on that stale reading drops the plan — which costs the
+// subscription its rate limit until some later event happens to reinstate it —
+// so it is worth one extra call to the gateway to be sure.
+func (m *Mediator) planAllowed(
+	ctx context.Context,
+	resolved resolvedAPI,
+	planName string,
+	log *slog.Logger,
+) (resolvedAPI, bool) {
+	if planEnabledForAPI(resolved, planName) {
+		return resolved, true
+	}
+	if !resolved.fromCache {
+		// Read from the gateway while handling this event. Reading it again
+		// would return the same answer.
+		return resolved, false
+	}
+	fresh, err := m.resolver.refreshAPI(ctx, resolved)
+	if err != nil {
+		// The cached allowlist is all there is to go on. Treating the plan as
+		// disabled matches what the gateway would do with it anyway.
+		log.Warn("could not re-read the gateway API's plan allowlist; deciding on the cached one",
+			slog.String("gateway_api_handle", resolved.handle), slog.Any("error", err))
+		return resolved, false
+	}
+	if planEnabledForAPI(fresh, planName) {
+		log.Info("the plan is enabled for this gateway API on a fresh read; the cached allowlist was stale",
+			slog.String("plan_name", planName), slog.String("gateway_api_handle", fresh.handle))
+		return fresh, true
+	}
+	return fresh, false
 }
 
 // createSubscription creates the subscription, absorbing the two outcomes that
@@ -146,7 +188,7 @@ func (m *Mediator) createSubscription(
 	}
 
 	if apiErr.IsNotFound() {
-		m.resolver.invalidateAPI(resolved.handle)
+		m.resolver.invalidateAPI(resolved.cacheKey)
 		return nil, fmt.Errorf("the gateway no longer has API %q: %w", resolved.handle, err)
 	}
 	if apiErr.StatusCode < 500 {
@@ -284,10 +326,13 @@ func (m *Mediator) recreate(
 	}
 
 	planName := data.Plan.Display()
-	if planID != "" && planName != "" && !planEnabledForAPI(resolved, planName) {
-		log.Warn("the new plan is not enabled for this gateway API; recreating without a plan",
-			slog.String("plan_name", planName))
-		planID = ""
+	if planID != "" && planName != "" {
+		var allowed bool
+		if resolved, allowed = m.planAllowed(ctx, resolved, planName, log); !allowed {
+			log.Warn("the new plan is not enabled for this gateway API; recreating without a plan",
+				slog.String("plan_name", planName))
+			planID = ""
+		}
 	}
 
 	status := record.Status

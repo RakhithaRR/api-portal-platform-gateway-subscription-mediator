@@ -129,6 +129,7 @@ Set these once; every command below uses them.
 
 ```bash
 # WSO2 API Manager
+export APIM=<apim-url>
 export APIM_USER=<apim-admin-username>
 export APIM_PASS=<apim-admin-password>
 
@@ -487,12 +488,18 @@ curl -sk -X POST "$PORTAL/webhook-subscribers" \
        \"targetUrl\":\"http://host.docker.internal:8085/devportal/events\",
        \"secret\":\"$WEBHOOK_SECRET\",
        \"events\":[\"apikey.*\",\"subscription.*\"],
-       \"enabled\":true}"
+       \"enabled\":true,
+       \"timeoutMs\":15000}"
 ```
 
 `targetUrl` has to be resolvable **from wherever the portal runs** — use
 `localhost:8085` if the portal is on the host, or the machine's routable address
 if it's elsewhere.
+
+`timeoutMs` defaults to `5000`, which is tighter than it looks: the portal gives
+up after one attempt, and the mediator's first connection after some idle
+minutes can take longer than that through Docker Desktop's
+`host.docker.internal`. Raising it costs nothing and prevents a dropped event.
 
 > The secret does double duty: it signs each delivery *and* derives the key that
 > encrypts the subscription token and API key inside it. If it doesn't match, the
@@ -733,6 +740,23 @@ The API Portal **attempts each delivery exactly once** — there is no retry and
 dead-letter queue on its side. Anything the mediator rejects is marked `FAILED`
 in the portal and never resent, which is why the mediator persists every accepted
 event before acknowledging it, and why `/failed/requeue` exists.
+
+A delivery can also be marked `FAILED` **without the mediator ever seeing it** —
+a connection timeout, most likely. The mediator then has nothing to requeue, and
+its own counters stay clean: `/status` reports `failed: 0` and `/failed` is
+empty while a portal action has in fact been lost, leaving the gateway out of
+sync with nothing to reconcile it. Only the portal knows:
+
+```bash
+curl -sk "$PORTAL/webhook-subscribers/subscription-mediator/deliveries" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq -r '.list[] | select(.status != "DELIVERED")
+           | "\(.occurredAt) \(.eventType) \(.status) \(.lastError)"'
+```
+
+Anything listed has to be recovered by **redoing the portal action** — there is
+no redelivery endpoint. Worth checking whenever the gateway and the portal
+disagree and the mediator reports nothing wrong.
 
 ## References
 

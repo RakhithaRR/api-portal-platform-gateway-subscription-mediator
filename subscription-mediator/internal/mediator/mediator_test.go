@@ -65,6 +65,19 @@ func (f *fakeGateway) addAPI(displayName, version, handle string, planNames ...s
 	f.apis = append(f.apis, api)
 }
 
+// setAPIPlans rewrites an API's plan allowlist, standing in for an operator
+// widening it on the gateway with no portal event to announce the change.
+func (f *fakeGateway) setAPIPlans(handle string, planNames ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.apis {
+		if f.apis[i].Handle() == handle {
+			f.apis[i].Spec.SubscriptionPlans = planNames
+			return
+		}
+	}
+}
+
 func (f *fakeGateway) id(prefix string) string {
 	f.nextID++
 	return fmt.Sprintf("%s-%d", prefix, f.nextID)
@@ -696,6 +709,61 @@ func TestPlanRejectedByTheAPIFallsBackToNoPlan(t *testing.T) {
 	}
 	if token != testToken {
 		t.Error("the fallback lost the token")
+	}
+}
+
+// An allowlist widened on the gateway must take effect on the next event, not
+// once the cached copy expires. The cache has no invalidation signal for this —
+// nothing on the portal side knows the gateway changed — so a plan change
+// arriving inside APICacheTTL was silently applied without its plan, leaving
+// the subscription unthrottled.
+func TestWidenedAllowlistIsSeenBeforeTheCacheExpires(t *testing.T) {
+	fake := newFakeGateway()
+	fake.addAPI("Order API", "v1.0", "order-api-v1.0", "Gold") // Platinum not allowed yet
+	h := newHarness(t, fake, nil)
+
+	if err := h.applyNow(t, createdEvent(t, "evt-1")); err != nil {
+		t.Fatalf("create = %v", err)
+	}
+	if sub, _ := fake.onlySub(t); sub.SubscriptionPlanID == "" {
+		t.Fatal("the initial subscription lost its allowed plan")
+	}
+
+	// The operator widens the gateway API. No event announces it, and the
+	// resolution cached by the create above is still well inside its TTL.
+	fake.setAPIPlans("order-api-v1.0", "Gold", "Platinum")
+
+	body := buildEvent(t, "evt-2", webhook.EventSubscriptionPlanChanged, map[string]any{
+		"subscription_id": "portal-sub-1", "status": "ACTIVE", "application_id": "portal-app-1",
+		"subscription_plan": map[string]string{"ref_id": "portal-plan-platinum", "name": "Platinum"},
+		"api":               apiRef(),
+	})
+	if err := h.applyNow(t, body); err != nil {
+		t.Fatalf("apply(subscription.plan_changed) = %v", err)
+	}
+
+	sub, _ := fake.onlySub(t)
+	if sub.SubscriptionPlanID == "" {
+		t.Fatal("the plan was dropped on a stale allowlist; the subscription is left unthrottled")
+	}
+	plan, ok := fake.plans[sub.SubscriptionPlanID]
+	if !ok || !strings.EqualFold(plan.PlanName, "Platinum") {
+		t.Errorf("subscription carries plan %q, want Platinum", sub.SubscriptionPlanID)
+	}
+}
+
+// The confirming re-read must not turn the genuine fallback into a retry loop
+// or a kept plan: a plan absent from a fresh allowlist is still dropped.
+func TestPlanAbsentFromAFreshAllowlistIsStillDropped(t *testing.T) {
+	fake := newFakeGateway()
+	fake.addAPI("Order API", "v1.0", "order-api-v1.0", "Bronze") // Gold never allowed
+	h := newHarness(t, fake, nil)
+
+	if err := h.applyNow(t, createdEvent(t, "evt-1")); err != nil {
+		t.Fatalf("apply() = %v, want a fallback to no plan", err)
+	}
+	if sub, _ := fake.onlySub(t); sub.SubscriptionPlanID != "" {
+		t.Error("the subscription kept a plan no reading of the allowlist allows")
 	}
 }
 

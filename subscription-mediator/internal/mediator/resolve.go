@@ -24,6 +24,12 @@ type resolvedAPI struct {
 	// planNames is the API's own subscription-plan allowlist. When non-empty the
 	// gateway rejects a subscription whose plan is not in it.
 	planNames []string
+	// cacheKey is the key this resolution is cached under, so a caller holding a
+	// resolvedAPI can invalidate or refresh it without rebuilding the key.
+	cacheKey string
+	// fromCache marks a resolution served from the cache rather than read from
+	// the gateway during this call. Only a cached reading can be out of date.
+	fromCache bool
 	at        time.Time
 }
 
@@ -73,6 +79,7 @@ func (r *resolver) resolveAPI(ctx context.Context, ref *webhook.APIRef) (resolve
 	cached, ok := r.apiCache[cacheKey]
 	if ok && time.Since(cached.at) < APICacheTTL {
 		r.mu.Unlock()
+		cached.fromCache = true
 		return cached, nil
 	}
 	r.mu.Unlock()
@@ -96,7 +103,7 @@ func (r *resolver) resolveAPI(ctx context.Context, ref *webhook.APIRef) (resolve
 		return resolvedAPI{}, err
 	}
 
-	resolved := resolvedAPI{handle: handle, planNames: planNames, at: time.Now()}
+	resolved := resolvedAPI{handle: handle, planNames: planNames, cacheKey: cacheKey, at: time.Now()}
 	r.cache(cacheKey, resolved)
 	if err := r.store.PutAPIMapping(cacheKey, handle); err != nil {
 		// The mapping is a cache, not the source of truth: failing to persist it
@@ -146,7 +153,8 @@ func (r *resolver) describeHandle(ctx context.Context, handle, cacheKey string) 
 	}
 	for i := range apis {
 		if strings.EqualFold(apis[i].Handle(), handle) || strings.EqualFold(apis[i].Metadata.Name, handle) {
-			resolved := resolvedAPI{handle: apis[i].Handle(), planNames: apis[i].Spec.SubscriptionPlans, at: time.Now()}
+			resolved := resolvedAPI{handle: apis[i].Handle(), planNames: apis[i].Spec.SubscriptionPlans,
+				cacheKey: cacheKey, at: time.Now()}
 			r.cache(cacheKey, resolved)
 			return resolved, nil
 		}
@@ -236,6 +244,19 @@ func (r *resolver) invalidateAPI(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.apiCache, key)
+}
+
+// refreshAPI re-reads an API's plan allowlist from the gateway, bypassing the
+// cached copy. The allowlist is the one part of a resolution that changes
+// without any portal event to announce it — an operator can widen it on the
+// gateway at any time — so a decision that turns on it must not be taken on a
+// reading up to APICacheTTL old.
+func (r *resolver) refreshAPI(ctx context.Context, resolved resolvedAPI) (resolvedAPI, error) {
+	if resolved.handle == "" {
+		return resolved, fmt.Errorf("cannot refresh an unresolved API")
+	}
+	r.invalidateAPI(resolved.cacheKey)
+	return r.describeHandle(ctx, resolved.handle, resolved.cacheKey)
 }
 
 // planEnabledForAPI reports whether a plan name is acceptable for an API. An API
