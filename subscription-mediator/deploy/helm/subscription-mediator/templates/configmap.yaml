@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "subscription-mediator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "subscription-mediator.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    {{- include "subscription-mediator.configToml" . | nindent 4 }}

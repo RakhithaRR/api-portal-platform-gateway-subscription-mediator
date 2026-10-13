@@ -1,0 +1,42 @@
+{{- $fullname := include "subscription-mediator.fullname" . -}}
+subscription-mediator {{ include "subscription-mediator.imageVersion" . }} is deployed as StatefulSet {{ .Release.Namespace }}/{{ $fullname }} (one replica).
+
+1. Register this webhook targetUrl with the API Portal subscriber:
+
+     http://{{ $fullname }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/devportal/events
+
+   The secret registered there must equal the webhook secret in Secret
+   {{ .Release.Namespace }}/{{ include "subscription-mediator.secretName" . }}.
+
+2. Check it is up and has reached the gateway:
+
+     kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ $fullname }}
+     kubectl -n {{ .Release.Namespace }} logs statefulset/{{ $fullname }}
+     helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+3. /status, /failed and POST /failed/requeue are unauthenticated and
+   reachable only inside the cluster. Use a port-forward:
+
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fullname }} 8085:{{ .Values.service.port }}
+     curl -s localhost:8085/status
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence is disabled. Every restart loses the pending event queue
+and the API mappings, and the API Portal never redelivers. Do not run this way
+in any environment whose subscriptions matter.
+{{- end }}
+{{- if and (not .Values.image.digest) (has .Values.image.tag (list "dev" "latest")) }}
+
+WARNING: image.tag "{{ .Values.image.tag }}" moves. A pod restart can start a
+different build than the one you deployed. Pin the sha-<commit> tag or a digest.
+{{- end }}
+{{- if and .Values.secret.create (not .Values.secret.existingSecret) }}
+
+NOTE: the credentials Secret is created from Helm values, so they are stored in
+the release history. Prefer secret.existingSecret in production.
+{{- end }}
+{{- if not .Values.networkPolicy.enabled }}
+
+NOTE: networkPolicy is disabled; any pod in the cluster can reach every
+endpoint, including POST /failed/requeue.
+{{- end }}

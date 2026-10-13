@@ -66,10 +66,15 @@ replays them onto the gateway's management REST API.
 ## What's in here
 
 ```
+RUNBOOK.md                  operating it in dev: release, deploy, rotate,
+                            monitor, and the incident playbooks
 agent-verification.md       an end-to-end test script for a coding agent —
                             every subscription and API-key operation, asserted
 subscription-mediator/      the bridge itself — Go, runs in Docker
                             (see its own README for internals and operations)
+.github/workflows/          CI: tests the mediator and publishes its image to
+                            the dev Azure Container Registry (setup: the
+                            mediator README, "Publishing the image")
 resources/                  the sample APIs (see resources/README.md)
   echo-api/                 a trivial httpbin-backed API
   reading-list-api/         a small CRUD API

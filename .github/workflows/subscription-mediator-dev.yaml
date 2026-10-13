@@ -1,0 +1,197 @@
+# Builds subscription-mediator and publishes a multi-arch image to the dev
+# Azure Container Registry.
+#
+#   pull request → vet, test, govulncheck, and a multi-arch build that is not pushed
+#   push to main → verify, then build linux/amd64 + linux/arm64 and push to ACR
+#   manual run   → same as a push to main, for the selected branch
+#
+# Azure sign-in is OIDC federation with a user-assigned managed identity, so no
+# password or client secret exists anywhere. The identifiers it needs are set on
+# the `dev` GitHub environment:
+#
+#   secrets.AZURE_CLIENT_ID        client ID of the managed identity (has AcrPush)
+#   secrets.AZURE_TENANT_ID        Entra tenant ID
+#   secrets.AZURE_SUBSCRIPTION_ID  subscription that holds the registry
+#   vars.ACR_NAME                  registry name, without .azurecr.io
+#
+# The three IDs are not credentials, but they are secrets rather than variables
+# so they are masked in the run logs, which are public on a public repository.
+# ACR_NAME stays a variable: it is part of every image reference the run prints.
+#
+# Tags pushed: sha-<short commit> (immutable, deploy by this or by digest) and
+# dev (moves to the newest main build).
+#
+# Actions are pinned to commit SHAs; the comment beside each is the release.
+
+name: subscription-mediator (dev)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "subscription-mediator/**"
+      - ".github/workflows/subscription-mediator-dev.yaml"
+  pull_request:
+    paths:
+      - "subscription-mediator/**"
+      - ".github/workflows/subscription-mediator-dev.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref at a time. Pull request runs are superseded by newer pushes;
+# publishing runs are never cancelled partway through a push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_NAME: subscription-mediator
+  PLATFORMS: linux/amd64,linux/arm64
+  GOVULNCHECK_VERSION: v1.9.0
+
+defaults:
+  run:
+    working-directory: subscription-mediator
+
+jobs:
+  verify:
+    name: Vet, test and scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: subscription-mediator/go.mod
+          cache-dependency-path: subscription-mediator/go.sum
+
+      - name: Check go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      # Fails the build on any vulnerability the code can reach, including the
+      # Go standard library of the toolchain go.mod selects.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION} ./...
+
+  # Pull requests prove the Dockerfile builds for every platform, without Azure
+  # access: no environment, no OIDC token, nothing pushed.
+  build-check:
+    name: Build image (no push)
+    if: github.event_name == 'pull_request'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: subscription-mediator
+          platforms: ${{ env.PLATFORMS }}
+          push: false
+          cache-from: type=gha,scope=subscription-mediator
+
+  publish:
+    name: Build and push to dev ACR
+    if: github.event_name != 'pull_request'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The `dev` environment holds the Azure settings, and its protection rules
+    # (e.g. deployment branches: main) gate who can push.
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Azure sign-in (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR sign-in
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: az acr login --name "$ACR_NAME"
+
+      # The Go build cross-compiles natively; QEMU only runs the arm64 runtime
+      # stage's RUN steps (apk add, adduser, mkdir/chown).
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          # Annotate the multi-arch index too, not only each platform's
+          # manifest, so registries show the metadata on the tag itself.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ vars.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=dev
+          labels: |
+            org.opencontainers.image.title=subscription-mediator
+            org.opencontainers.image.description=Bridges WSO2 API Portal webhook events to the WSO2 API Platform Gateway
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: subscription-mediator
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=subscription-mediator
+          cache-to: type=gha,mode=max,scope=subscription-mediator
+
+      - name: Summary
+        env:
+          REGISTRY: ${{ vars.ACR_NAME }}.azurecr.io
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Pushed to ${REGISTRY}"
+            echo ""
+            echo "Digest: \`${DIGEST}\`"
+            echo ""
+            echo "Tags:"
+            echo "${TAGS}" | sed 's/^/- `/; s/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"

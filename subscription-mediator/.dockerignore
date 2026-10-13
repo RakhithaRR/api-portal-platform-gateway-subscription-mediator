@@ -1,0 +1,16 @@
+# Keep secrets and local state out of the build context. .env holds the webhook
+# secret and gateway credentials; configs/config.toml is bind-mounted at run time.
+.env
+configs/
+data/
+
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yaml
+Makefile
+*.md
+
+# Kubernetes manifests; not part of the image.
+deploy/

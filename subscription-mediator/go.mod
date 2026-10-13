@@ -1,6 +1,6 @@
 module subscription-mediator
 
-go 1.26.5
+go 1.26.9
 
 require (
 	github.com/go-viper/mapstructure/v2 v2.5.0

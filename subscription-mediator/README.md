@@ -157,9 +157,15 @@ exercises every one of them with expected results.
 ## Commands
 
 ```bash
-make test      # run the tests
-make build     # build the image (docker compose build)
+make test                       # run the tests
+make build                      # build the image (also tagged for docker compose)
+make build-and-push-multiarch \
+  DOCKER_REGISTRY=<registry> VERSION=<x.y.z>   # linux/amd64 + linux/arm64, pushed
+make help                       # every target and the variables they take
 ```
+
+Publishing to the dev registry is normally left to CI — see [Publishing the
+image](#publishing-the-image).
 
 Everything else is plain Compose:
 
@@ -170,6 +176,19 @@ docker compose ps
 docker compose down        # stop, keeping the state volume
 docker compose down -v     # ...and delete the state volume
 ```
+
+The container runs as UID/GID `10001`, not root. A state volume created by an
+older, root-running image is still root-owned and the service can no longer
+write to it; hand it over once (it keeps the mappings and queued events):
+
+```bash
+docker compose down
+docker run --rm -v subscription-mediator_mediator-data:/data alpine:3.24 chown -R 10001:10001 /data
+docker compose up -d
+```
+
+A host directory mounted at `/app/data` instead of the volume needs the same
+ownership (`chown -R 10001:10001 <dir>`); on Kubernetes, set `fsGroup: 10001`.
 
 `configs/config.toml` is bind-mounted, so a configuration change needs only
 `docker compose restart` — no rebuild.
@@ -185,6 +204,199 @@ retries a few times, then stays `Exited` with the reason as its last log line:
 subscription-mediator: /app/config.toml: [webhook] secret is required — it verifies
 each delivery and decrypts the subscription token, and must match the secret
 registered with the API Portal subscriber
+```
+
+---
+
+## Publishing the image
+
+[`.github/workflows/subscription-mediator-dev.yaml`](../.github/workflows/subscription-mediator-dev.yaml)
+publishes a multi-arch image (linux/amd64, linux/arm64) to the **dev** Azure
+Container Registry. It only runs for changes under `subscription-mediator/`:
+
+| Event | What runs |
+|---|---|
+| Pull request | `go mod tidy` check, `go vet`, `go test -race`, `govulncheck`, then a multi-arch image build that is **not** pushed. No Azure access. |
+| Push to `main` | The same checks, then build and push to ACR |
+| Manual run (*Run workflow*) | Same as a push to `main`, for the chosen branch |
+
+Each push to ACR carries two tags:
+
+- `sha-<short commit>`: never moves. Deploy by this tag or by the digest
+  printed in the run summary.
+- `dev`: moves to the newest build from `main`.
+
+Every image also carries an SBOM and build provenance. The workflow never pushes
+`:latest`.
+
+The workflow signs in to Azure with **OIDC federation**. GitHub hands the run a
+short-lived token that names the repository and the environment the job runs
+in. Azure trusts that token for one managed identity, and that identity may only
+push to the one registry. No password or client secret exists anywhere, so
+there is nothing to leak or rotate.
+
+The setup is done once, in Azure and then in GitHub.
+
+### Before you start
+
+- The Azure CLI, signed in (`az login`) to the subscription that holds the
+  registry.
+- On the resource group: **Contributor** or **Managed Identity Contributor**,
+  to create the identity.
+- On the registry: **Owner**, **User Access Administrator** or **Role Based
+  Access Control Administrator**, to grant it roles.
+- **Admin** on the GitHub repository, to create the environment.
+
+### 1. Azure: create the identity and let it push
+
+Fill in the first five values. `REPO` must be the repository the workflow
+**runs in**. A fork, and the repository it was forked from, each need their own
+federated credential.
+
+```bash
+RG=<resource-group>                 # where the identity will live
+ACR=<registry-name>                 # without .azurecr.io
+REPO=<owner>/<repo>                 # e.g. RakhithaRR/api-portal-platform-gateway-subscription-mediator
+ENVIRONMENT=dev                     # the GitHub environment the publish job uses
+IDENTITY=subscription-mediator-ci
+
+# A user-assigned managed identity for the workflow
+az identity create -g "$RG" -n "$IDENTITY"
+PRINCIPAL_ID=$(az identity show -g "$RG" -n "$IDENTITY" --query principalId -o tsv)
+ACR_ID=$(az acr show -n "$ACR" --query id -o tsv)
+
+# AcrPush lets it push images; Reader on the registry lets `az acr login` find
+# the registry through Azure Resource Manager. Both apply to this registry only.
+for role in AcrPush Reader; do
+  az role assignment create --role "$role" --scope "$ACR_ID" \
+    --assignee-object-id "$PRINCIPAL_ID" --assignee-principal-type ServicePrincipal
+done
+
+# Trust GitHub's OIDC tokens, but only for jobs in the `dev` environment of REPO
+az identity federated-credential create -g "$RG" --identity-name "$IDENTITY" \
+  -n "github-${ENVIRONMENT}" \
+  --issuer https://token.actions.githubusercontent.com \
+  --subject "repo:${REPO}:environment:${ENVIRONMENT}" \
+  --audiences api://AzureADTokenExchange
+
+# The three IDs GitHub needs in step 2
+az identity show -g "$RG" -n "$IDENTITY" --query clientId -o tsv    # AZURE_CLIENT_ID
+az account show --query tenantId -o tsv                              # AZURE_TENANT_ID
+az account show --query id -o tsv                                    # AZURE_SUBSCRIPTION_ID
+```
+
+The subject has to match exactly. It is case-sensitive, and it changes if the
+repository is renamed or transferred, or if the job's environment is renamed.
+
+If the registry's *Role assignment permissions mode* is **RBAC Registry + ABAC
+Repository Permissions**, AcrPush has no effect. Assign **Container Registry
+Repository Writer** instead.
+
+### 2. GitHub: the `dev` environment
+
+In the repository, open **Settings → Environments → New environment** and name it
+`dev`. That name must match `ENVIRONMENT` above and `environment: dev` in the
+workflow.
+
+- **Deployment branches and tags:** choose *Selected branches and tags* and add
+  `main`. Any job can claim `environment: dev`, so this rule is what stops a
+  manual run from another branch from pushing to the registry.
+- **Environment secrets:**
+
+  | Name | Value |
+  |---|---|
+  | `AZURE_CLIENT_ID` | the identity's client ID |
+  | `AZURE_TENANT_ID` | the Entra tenant ID |
+  | `AZURE_SUBSCRIPTION_ID` | the subscription that holds the registry |
+
+  None of these is a credential: without a GitHub token that matches the
+  federated credential, they get nobody into Azure. They are secrets so they are
+  masked in the run logs, which anyone can read on a public repository. Add them
+  to the **environment**, not the repository, so only the publish job can read
+  them.
+- **Environment variables:**
+
+  | Name | Value |
+  |---|---|
+  | `ACR_NAME` | the registry name, without `.azurecr.io` |
+
+  This one is a variable because it is part of every image reference the run
+  prints. A secret would mask the tags and the summary as `***`.
+- **Optional:** *Required reviewers*, to have each push to the registry approved
+  by a person.
+
+The same settings from the command line, if you prefer:
+
+```bash
+gh api -X PUT "repos/$REPO/environments/dev" \
+  -F "deployment_branch_policy[protected_branches]=false" \
+  -F "deployment_branch_policy[custom_branch_policies]=true"
+gh api -X POST "repos/$REPO/environments/dev/deployment-branch-policies" -f name=main
+gh secret set AZURE_CLIENT_ID       --env dev --repo "$REPO" --body "<client-id>"
+gh secret set AZURE_TENANT_ID       --env dev --repo "$REPO" --body "<tenant-id>"
+gh secret set AZURE_SUBSCRIPTION_ID --env dev --repo "$REPO" --body "<subscription-id>"
+gh variable set ACR_NAME            --env dev --repo "$REPO" --body "<registry-name>"
+```
+
+Then make sure Actions is enabled. On a fork it is off until you open the
+**Actions** tab and enable workflows.
+
+### 3. First run and checks
+
+Start it from **Actions → subscription-mediator (dev) → Run workflow** on `main`,
+or push a change under `subscription-mediator/`. When it finishes, the run
+summary lists the digest and the tags. Then check the registry:
+
+```bash
+az acr repository show-tags -n "$ACR" --repository subscription-mediator -o table
+docker buildx imagetools inspect "$ACR.azurecr.io/subscription-mediator:dev"   # linux/amd64 and linux/arm64
+```
+
+### When it fails
+
+| Symptom | Cause and fix |
+|---|---|
+| `AADSTS700213` / *No matching federated identity record found* | The subject doesn't match. It must be `repo:<owner>/<repo>:environment:dev`, with the owner and repository the run belongs to: check for a fork, a rename or a transfer. |
+| The publish job waits, or says the branch is not allowed to deploy | The `dev` environment's branch rule doesn't include the branch you ran from. |
+| `Login failed` before any Azure call, with an empty client-id or tenant-id | The secrets are on the repository or another environment, not on `dev`, or their names are misspelt. |
+| `az acr login` can't find the registry | `ACR_NAME` is missing or includes `.azurecr.io`, or the identity lacks Reader on the registry. |
+| `denied` / `unauthorized` on push | AcrPush is missing. A new role assignment can take a few minutes to apply, so re-run once. On an ABAC-mode registry, see step 1. |
+| The push can't reach the registry | The registry allows only private endpoints or selected networks. GitHub-hosted runners can't reach it, so use a self-hosted runner inside that network. |
+| *Check go.mod and go.sum are tidy* fails | Run `go mod tidy` in `subscription-mediator/` and commit the result. |
+| *govulncheck* fails | A reachable vulnerability: often the Go standard library. Raise `go` in `go.mod` and the `golang:` tag in the Dockerfile to the fixed release. Both must move together, and setup-go follows `go.mod`. |
+
+### Publishing from a workstation
+
+The Makefile does the same build by hand, signed in as yourself rather than as
+the identity:
+
+```bash
+az acr login --name "$ACR"
+make build-and-push-multiarch DOCKER_REGISTRY="$ACR.azurecr.io" VERSION=<x.y.z>
+```
+
+This pushes `:<x.y.z>` and `:latest`; add `PUSH_LATEST=false` to keep `:latest`
+where it is. Unlike the workflow, the result has no SBOM or provenance
+attached.
+
+---
+
+## Deploying to Kubernetes
+
+[`deploy/helm/subscription-mediator`](deploy/helm/subscription-mediator/README.md)
+is a Helm chart for Kubernetes 1.29+. It runs the mediator as a single-replica
+StatefulSet with its own persistent volume. The service has one state file and
+no leader election, so it must never run as two pods. The chart README covers:
+
+- the install;
+- credentials kept out of Helm;
+- network policy;
+- what an upgrade or a node drain costs. Webhooks that arrive while the pod is
+  down are lost, because the API Portal does not retry.
+
+```bash
+helm upgrade --install subscription-mediator deploy/helm/subscription-mediator \
+  -n subscription-mediator -f values-dev.yaml --set image.tag=sha-<commit> --atomic --wait
 ```
 
 ---
@@ -443,10 +655,12 @@ token in the portal, which sends a fresh event the mediator can apply in full.
 
 ```
 Dockerfile                   build context is THIS directory
+.dockerignore                keeps .env, configs/ and local state out of it
 docker-compose.yaml          how it runs
 configs/config.toml          all configuration; mounted read-only
 configs/config-template.toml the annotated version to copy from
-Makefile                     make build, make test
+Makefile                     make build, make test, make build-and-push-multiarch
+deploy/helm/                 the Helm chart for Kubernetes
 cmd/subscription-mediator/   startup and wiring
 internal/config/             file + env loading, validation, fixed constants
 internal/webhook/            envelope, HMAC verification, AES-256-GCM decryption

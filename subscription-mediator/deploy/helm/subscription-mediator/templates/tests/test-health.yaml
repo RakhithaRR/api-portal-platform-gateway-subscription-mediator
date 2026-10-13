@@ -1,0 +1,50 @@
+{{- if .Values.tests.enabled }}
+# `helm test <release>`: calls /health through the Service, using the mediator
+# image itself (its busybox wget), so no extra image has to be pulled.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "subscription-mediator.fullname" . }}-test
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "subscription-mediator.testSelectorLabels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: health
+      image: {{ include "subscription-mediator.image" . | quote }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command:
+        - wget
+        - -qO-
+        - -T
+        - "5"
+        - http://{{ include "subscription-mediator.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/health
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+{{- end }}

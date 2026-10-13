@@ -1,0 +1,52 @@
+# Example: the dev environment on AKS, with the gateway and the API Portal in
+# the same cluster. Copy it, replace every <...>, and install with:
+#
+#   helm upgrade --install subscription-mediator deploy/helm/subscription-mediator \
+#     -n subscription-mediator -f values-dev.yaml \
+#     --set image.tag=sha-<commit>
+#
+# The namespaces and labels below are examples; check yours with
+#   kubectl get pods -A --show-labels
+
+image:
+  repository: <registry>.azurecr.io/subscription-mediator
+  # Set per deploy with --set image.tag=sha-<commit>, or pin a digest.
+  tag: ""
+
+config:
+  gateway:
+    baseUrl: http://<gateway-release>-gateway-controller.<gateway-namespace>.svc:9090/api/management/v1
+  logging:
+    level: info
+  apiHandles: {}
+
+secret:
+  # Created outside the chart, e.g. synced from Azure Key Vault by External
+  # Secrets Operator. Keys: webhook-secret, gateway-username, gateway-password.
+  existingSecret: subscription-mediator-credentials
+
+persistence:
+  enabled: true
+  # AKS: managed-csi (Azure Disk) supports ReadWriteOncePod.
+  storageClass: managed-csi
+  size: 1Gi
+
+networkPolicy:
+  enabled: true
+  ingress:
+    from:
+      # The API Portal, which delivers the webhooks.
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: <api-portal-namespace>
+  egress:
+    allowDNS: true
+    rules:
+      # The Gateway Controller management API.
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: <gateway-namespace>
+        ports:
+          - port: 9090
+            protocol: TCP

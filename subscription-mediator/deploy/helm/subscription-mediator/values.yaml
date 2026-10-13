@@ -1,0 +1,211 @@
+# Default values for subscription-mediator.
+#
+# The mediator keeps all of its state - API mappings, subscription tokens and
+# the pending event queue - in one file on a persistent volume. It has no
+# leader election, so the chart always runs exactly ONE replica as a
+# StatefulSet. There is deliberately no replicaCount or autoscaling value.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Registry and repository, e.g. myregistry.azurecr.io/subscription-mediator.
+  repository: ""
+  # Pin an immutable tag: the sha-<commit> tag CI pushes. A moving tag such as
+  # `dev` lets a pod restart silently pick up a different build.
+  tag: ""
+  # Optional image digest (sha256:...). When set it takes precedence over tag,
+  # which is then kept only as a human-readable hint.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Only needed when the cluster cannot already pull from the registry. On AKS,
+# prefer `az aks update --attach-acr <registry>` and leave this empty.
+imagePullSecrets: []
+#  - name: acr-pull
+
+# --- Configuration ----------------------------------------------------------
+# Rendered into config.toml in a ConfigMap. Credentials never go here; see
+# `secret` below.
+config:
+  gateway:
+    # The Gateway Controller management REST API. In the same cluster, use the
+    # controller Service's DNS name and REST port (9090), e.g.
+    #   http://<release>-gateway-controller.<namespace>.svc:9090/api/management/v1
+    baseUrl: ""
+  logging:
+    # debug, info, warn or error.
+    level: info
+  # Pins a portal API to a gateway API handle when name + version matching
+  # cannot tell which API is meant. Keys are "<name>:<version>" or the
+  # portal's api ref_id, matched case-insensitively. GET /failed names the
+  # exact key to add.
+  apiHandles: {}
+  #  "order api:v1.0": orderapi-1.0.0
+
+# --- Credentials ------------------------------------------------------------
+# The webhook secret and the gateway's admin credentials, injected as
+# environment variables from a Kubernetes Secret.
+secret:
+  # Name of an existing Secret to read from (recommended). Create it outside
+  # the chart - External Secrets Operator, the Azure Key Vault CSI driver,
+  # Sealed Secrets, or kubectl - so the values never pass through Helm.
+  existingSecret: ""
+  # Keys inside that Secret.
+  keys:
+    webhookSecret: webhook-secret
+    gatewayUsername: gateway-username
+    gatewayPassword: gateway-password
+  # Alternatively, let the chart create the Secret from the values below.
+  # Convenient for development; in production it puts the credentials into
+  # Helm's release history, so prefer existingSecret.
+  create: false
+  webhookSecret: ""
+  gatewayUsername: ""
+  gatewayPassword: ""
+
+# --- Storage ----------------------------------------------------------------
+persistence:
+  # Without persistence the queue and mappings are lost on every restart, and
+  # the API Portal never redelivers. Disable only for throwaway environments.
+  enabled: true
+  # Leave empty for the cluster's default StorageClass.
+  storageClass: ""
+  # ReadWriteOncePod guarantees only one pod can ever mount the volume. Use
+  # ReadWriteOnce if your CSI driver does not support it.
+  accessModes:
+    - ReadWriteOncePod
+  size: 1Gi
+  annotations: {}
+  # Mount an existing PVC instead of the StatefulSet's volume claim template.
+  existingClaim: ""
+  # What happens to the PVC when the StatefulSet is deleted or scaled down.
+  # Retain keeps queued events safe across an uninstall/reinstall.
+  retentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+
+# --- Workload ---------------------------------------------------------------
+serviceAccount:
+  create: true
+  # Defaults to the release's full name.
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+# The mediator drains in-flight requests (up to 20s) and then its workers (up
+# to 20s more) on SIGTERM; this leaves headroom for both. It stops accepting
+# webhooks as soon as SIGTERM arrives, so a longer value does not lengthen the
+# gap in which deliveries fail.
+terminationGracePeriodSeconds: 60
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  # Makes the state volume writable by the service user.
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    # The pending queue is capped at 5000 events, so memory stays small.
+    memory: 256Mi
+
+# On startup the mediator probes the gateway for up to 15s before it starts
+# listening, so the startup probe allows 60s before liveness takes over.
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 2
+  timeoutSeconds: 2
+  failureThreshold: 30
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Extra environment variables for the container.
+extraEnv: []
+#  - name: SM_LOG_LEVEL
+#    value: debug
+
+# Off by default. With a single replica, a budget blocks node drains and
+# cluster upgrades until the pod is deleted by hand. Turn it on to make every
+# eviction a deliberate, scheduled act, because webhooks that arrive while the
+# pod is down are lost (the API Portal does not retry).
+podDisruptionBudget:
+  enabled: false
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# --- Networking -------------------------------------------------------------
+# ClusterIP only: the API Portal runs in the same cluster, and every endpoint
+# of the mediator is unauthenticated, including /status, /failed and
+# POST /failed/requeue. Register this as the portal's webhook targetUrl:
+#   http://<fullname>.<namespace>.svc:<service.port>/devportal/events
+service:
+  port: 8085
+  annotations: {}
+
+# A NetworkPolicy limiting traffic to and from the mediator. Strongly
+# recommended in production; enabling it with no rules below allows no
+# inbound traffic except the chart's own `helm test` pod.
+networkPolicy:
+  enabled: false
+  ingress:
+    # Who may call the mediator on its HTTP port: the API Portal's pods.
+    from: []
+    #  - namespaceSelector:
+    #      matchLabels:
+    #        kubernetes.io/metadata.name: api-portal
+  egress:
+    # Allow DNS lookups to any namespace's port 53.
+    allowDNS: true
+    # Where the mediator may connect: the Gateway Controller. Each entry is a
+    # NetworkPolicyEgressRule.
+    rules: []
+    #  - to:
+    #      - namespaceSelector:
+    #          matchLabels:
+    #            kubernetes.io/metadata.name: api-gateway
+    #        podSelector:
+    #          matchLabels:
+    #            app.kubernetes.io/component: controller
+    #    ports:
+    #      - port: 9090
+    #        protocol: TCP
+
+# `helm test <release>` runs a pod that calls /health through the Service.
+tests:
+  enabled: true

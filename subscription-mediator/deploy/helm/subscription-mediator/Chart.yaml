@@ -1,0 +1,18 @@
+apiVersion: v2
+name: subscription-mediator
+description: >-
+  Bridges WSO2 API Portal 1.0.0 webhook events to the WSO2 API Platform
+  Gateway 1.2.0 management REST API.
+type: application
+version: 0.1.0
+# The image has no release versions yet; CI tags each build sha-<commit>.
+# image.tag or image.digest must therefore be set explicitly at install time.
+# ReadWriteOncePod (GA in 1.29) keeps the state volume to a single pod.
+kubeVersion: ">=1.29.0-0"
+keywords:
+  - wso2
+  - api-portal
+  - api-platform-gateway
+  - webhook
+sources:
+  - https://github.com/RakhithaRR/api-portal-platform-gateway-subscription-mediator

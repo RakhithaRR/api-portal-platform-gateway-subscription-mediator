@@ -1,0 +1,87 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "subscription-mediator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "subscription-mediator.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "subscription-mediator.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  {{- /*
+  A rule whose `from` is empty admits traffic from EVERYWHERE, so with no
+  peers at all the policy must render `ingress: []` (deny all) instead.
+  */}}
+  {{- if or .Values.tests.enabled .Values.networkPolicy.ingress.from }}
+  ingress:
+    - ports:
+        - port: http
+          protocol: TCP
+      from:
+        {{- if .Values.tests.enabled }}
+        # The chart's own `helm test` pod.
+        - podSelector:
+            matchLabels:
+              {{- include "subscription-mediator.testSelectorLabels" . | nindent 14 }}
+        {{- end }}
+        {{- with .Values.networkPolicy.ingress.from }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  {{- else }}
+  ingress: []
+  {{- end }}
+  egress:
+    {{- if .Values.networkPolicy.egress.allowDNS }}
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- end }}
+    {{- with .Values.networkPolicy.egress.rules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- if .Values.tests.enabled }}
+---
+# For the `helm test` pod only. Without it, a namespace with a default-deny
+# egress policy would stop the test from resolving or reaching the mediator.
+# It also denies all inbound traffic to the test pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "subscription-mediator.fullname" . }}-test
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "subscription-mediator.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "subscription-mediator.testSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "subscription-mediator.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: http
+          protocol: TCP
+{{- end }}
+{{- end }}

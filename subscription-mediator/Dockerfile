@@ -5,21 +5,32 @@
 #
 #   docker build -t subscription-mediator:dev .
 #
-# Or just `make build`, which runs `docker compose build` and gets this right.
+# Or just `make build`, which also applies the tag docker-compose.yaml runs.
 
-FROM golang:1.26-alpine AS build
+# The build stage runs on the builder's own platform and cross-compiles for the
+# target one, so a multi-arch build (`make build-and-push-multiarch`) compiles
+# natively instead of under QEMU emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "-s -w" \
     -o /out/subscription-mediator ./cmd/subscription-mediator
 
-FROM alpine:3.21
+FROM alpine:3.24
 
 # ca-certificates for an HTTPS gateway; wget (busybox) backs the healthcheck.
-RUN apk add --no-cache ca-certificates
+#
+# The service runs as an unprivileged user with a fixed numeric UID/GID, so
+# Kubernetes `runAsNonRoot` can verify it and a host directory mounted at
+# /app/data can be chowned to match (10001:10001).
+RUN apk add --no-cache ca-certificates \
+ && addgroup -S -g 10001 mediator \
+ && adduser -S -D -H -u 10001 -G mediator -h /app -s /sbin/nologin mediator
 
 WORKDIR /app
 COPY --from=build /out/subscription-mediator /app/subscription-mediator
@@ -29,8 +40,11 @@ COPY --from=build /out/subscription-mediator /app/subscription-mediator
 #
 # Mount a volume at /app/data to keep the mappings and the pending event queue
 # across restarts. Without it a restart loses the queue, and the API Portal
-# never redelivers.
-RUN mkdir -p /app/data
+# never redelivers. /app/data is the only path the service writes, and the only
+# one the service user owns; the binary stays root-owned and read-only to it.
+RUN mkdir -p /app/data && chown 10001:10001 /app/data
+
+USER 10001:10001
 
 EXPOSE 8085
 ENTRYPOINT ["/app/subscription-mediator"]
