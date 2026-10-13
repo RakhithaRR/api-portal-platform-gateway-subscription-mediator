@@ -206,6 +206,39 @@ each delivery and decrypts the subscription token, and must match the secret
 registered with the API Portal subscriber
 ```
 
+### Updating dependencies
+
+Run these from `subscription-mediator/`. First see what is out of date:
+
+```bash
+go list -m -u all | grep '\['        # module, current version, [newest version]
+```
+
+Then upgrade every dependency to its newest minor or patch release, and run
+the same checks CI runs:
+
+```bash
+go get -u ./...                      # direct and indirect dependencies
+go mod tidy                          # CI fails if go.mod or go.sum is untidy
+go vet ./...
+go test -race ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+```
+
+To move a single module instead, run `go get <module>@latest` (or
+`@<version>`), then `go mod tidy`. `go get -u` never crosses a major
+version: a new major (`/v3`, for example) is a different import path and
+means changing the imports by hand.
+
+The Go toolchain is separate. `go get -u` doesn't touch it. To move to a new
+Go release (see <https://go.dev/dl/>), change both of these to the same
+version in one commit. CI's setup-go reads `go.mod`.
+
+- the `go` line in `go.mod`, e.g. `go mod edit -go=1.26.9`
+- the `golang:<version>-alpine` tag in the `Dockerfile`
+
+Then rebuild the image (`make build`) to check the Docker build too.
+
 ---
 
 ## Publishing the image
