@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"subscription-mediator/internal/gateway"
-	"subscription-mediator/internal/store"
 	"subscription-mediator/internal/webhook"
 )
 
@@ -15,18 +14,20 @@ import (
 // subscription. The token arrives encrypted; the gateway stores only its hash,
 // so the token the developer sees in the portal is what validates at the gateway.
 func (m *Mediator) handleSubscriptionCreated(ctx context.Context, env *webhook.Envelope, log *slog.Logger) error {
-	var data webhook.SubscriptionData
-	if err := env.DecodeData(&data); err != nil {
-		return permanentf("%v", err)
-	}
-	if strings.TrimSpace(data.SubscriptionID) == "" {
-		return permanentf("data.subscription_id is required")
-	}
-
-	token, err := m.subscriptionToken(env, &data)
+	data, err := decodeSubscriptionData(env)
 	if err != nil {
 		return err
 	}
+	token, err := m.subscriptionToken(env, data)
+	if err != nil {
+		return err
+	}
+	return m.createSubscription(ctx, data, token, log)
+}
+
+// createSubscription creates the gateway subscription for a portal one, under
+// the portal's subscription ID as its reference ID.
+func (m *Mediator) createSubscription(ctx context.Context, data *webhook.SubscriptionData, token string, log *slog.Logger) error {
 	resolved, err := m.resolver.resolveAPI(ctx, &data.API)
 	if err != nil {
 		return err
@@ -49,38 +50,23 @@ func (m *Mediator) handleSubscriptionCreated(ctx context.Context, env *webhook.E
 		}
 	}
 
-	status := normalizeStatus(data.Status)
 	req := &gateway.SubscriptionCreateRequest{
+		ReferenceID:        data.SubscriptionID,
 		APIID:              resolved.handle,
 		SubscriptionToken:  token,
 		ApplicationID:      strings.TrimSpace(data.ApplicationID),
 		SubscriptionPlanID: planID,
-		Status:             status,
+		Status:             normalizeStatus(data.Status),
 	}
-	created, err := m.createSubscription(ctx, req, planName, resolved, log)
+	created, err := m.client.CreateSubscription(ctx, req)
 	if err != nil {
-		return err
-	}
-
-	record := &store.Subscription{
-		PortalSubscriptionID:  data.SubscriptionID,
-		GatewaySubscriptionID: created.ID,
-		GatewayAPIHandle:      resolved.handle,
-		GatewayPlanID:         req.SubscriptionPlanID,
-		PortalPlanRefID:       strings.TrimSpace(data.Plan.RefID),
-		PortalPlanName:        planName,
-		ApplicationID:         req.ApplicationID,
-		SubscriberID:          strings.TrimSpace(data.SubscriberID),
-		Status:                status,
-		APIName:               strings.TrimSpace(data.API.Name),
-		APIVersion:            strings.TrimSpace(data.API.Version),
-		Token:                 token,
-	}
-	if err := m.store.PutSubscription(record); err != nil {
-		// The gateway already has the subscription; failing here would retry the
-		// create. Surface it as what it is: the mapping is lost, so later
-		// lifecycle events for this subscription cannot be applied.
-		return fmt.Errorf("gateway subscription %s was created but the mapping could not be persisted: %w", created.ID, err)
+		created, err = m.recoverCreate(ctx, req, planName, resolved, err, log)
+		if err != nil {
+			return err
+		}
+		if created == nil {
+			return nil // it already existed
+		}
 	}
 
 	log.Info("created a gateway subscription",
@@ -88,8 +74,66 @@ func (m *Mediator) handleSubscriptionCreated(ctx context.Context, env *webhook.E
 		slog.String("gateway_subscription_id", created.ID),
 		slog.String("gateway_api_handle", resolved.handle),
 		slog.String("gateway_plan_id", req.SubscriptionPlanID),
-		slog.String("status", status))
+		slog.String("status", req.Status))
 	return nil
+}
+
+// recoverCreate handles a failed create. Two outcomes are not real failures:
+// the gateway rejecting the plan, which is retried without one, and a duplicate
+// delivery finding the subscription already there, which returns (nil, nil).
+func (m *Mediator) recoverCreate(
+	ctx context.Context,
+	req *gateway.SubscriptionCreateRequest,
+	planName string,
+	resolved resolvedAPI,
+	err error,
+	log *slog.Logger,
+) (*gateway.Subscription, error) {
+	apiErr, isAPIErr := gateway.AsAPIError(err)
+	if !isAPIErr {
+		return nil, fmt.Errorf("failed to create the gateway subscription: %w", err)
+	}
+
+	if isPlanRejection(apiErr) && req.SubscriptionPlanID != "" {
+		log.Warn("the gateway rejected the subscription plan; retrying without it",
+			slog.String("plan_name", planName), slog.String("gateway_message", apiErr.Message))
+		req.SubscriptionPlanID = ""
+		created, retryErr := m.client.CreateSubscription(ctx, req)
+		if retryErr == nil {
+			return created, nil
+		}
+		converted, ok := gateway.AsAPIError(retryErr)
+		if !ok {
+			return nil, fmt.Errorf("failed to create the gateway subscription without a plan: %w", retryErr)
+		}
+		apiErr, err = converted, retryErr
+	}
+
+	// A duplicate delivery, or a create whose response was lost after the
+	// gateway committed it. The reference ID says whether it is ours.
+	if apiErr.IsConflict() {
+		existing, findErr := m.client.FindSubscription(ctx, req.ReferenceID)
+		if findErr != nil {
+			return nil, fmt.Errorf("the gateway reported the subscription exists but looking it up failed: %w", findErr)
+		}
+		if existing != nil {
+			log.Info("the gateway already has this subscription; nothing to do",
+				slog.String("portal_subscription_id", req.ReferenceID),
+				slog.String("gateway_subscription_id", existing.ID))
+			return nil, nil
+		}
+		return nil, permanentf("the gateway rejected the subscription create as a conflict, and holds no "+
+			"subscription with reference ID %q: %s", req.ReferenceID, apiErr.Message)
+	}
+
+	if apiErr.IsNotFound() {
+		m.resolver.invalidateAPI(resolved.cacheKey)
+		return nil, permanentf("the gateway no longer has API %q: %s", resolved.handle, apiErr.Message)
+	}
+	if apiErr.StatusCode < 500 {
+		return nil, permanentf("the gateway rejected the subscription create: %s", apiErr.Message)
+	}
+	return nil, fmt.Errorf("failed to create the gateway subscription: %w", err)
 }
 
 // planAllowed reports whether planName is on the gateway API's plan allowlist,
@@ -131,341 +175,182 @@ func (m *Mediator) planAllowed(
 	return fresh, false
 }
 
-// createSubscription creates the subscription, absorbing the two outcomes that
-// are not real failures: the gateway rejecting the plan, and a duplicate
-// delivery finding the subscription already there.
-func (m *Mediator) createSubscription(
-	ctx context.Context,
-	req *gateway.SubscriptionCreateRequest,
-	planName string,
-	resolved resolvedAPI,
-	log *slog.Logger,
-) (*gateway.Subscription, error) {
-	created, err := m.client.CreateSubscription(ctx, req)
-	if err == nil {
-		return created, nil
-	}
-
-	apiErr, isAPIErr := gateway.AsAPIError(err)
-	if !isAPIErr {
-		return nil, fmt.Errorf("failed to create the gateway subscription: %w", err)
-	}
-
-	// The gateway validates the plan against the API's allowlist and status.
-	// Retry once without it.
-	if apiErr.IsBadRequest() && req.SubscriptionPlanID != "" &&
-		strings.Contains(strings.ToLower(apiErr.Message), "subscription plan") {
-		log.Warn("the gateway rejected the subscription plan; retrying without it",
-			slog.String("plan_name", planName), slog.String("gateway_message", apiErr.Message))
-		retry := *req
-		retry.SubscriptionPlanID = ""
-		created, retryErr := m.client.CreateSubscription(ctx, &retry)
-		if retryErr == nil {
-			req.SubscriptionPlanID = ""
-			return created, nil
-		}
-		converted, ok := gateway.AsAPIError(retryErr)
-		if !ok {
-			return nil, fmt.Errorf("failed to create the gateway subscription without a plan: %w", retryErr)
-		}
-		apiErr = converted
-	}
-
-	// A duplicate delivery, or a create whose response was lost after the
-	// gateway committed it. Adopt the existing subscription so state converges.
-	if apiErr.IsConflict() {
-		subs, listErr := m.client.ListSubscriptions(ctx, req.APIID, req.ApplicationID)
-		if listErr != nil {
-			return nil, fmt.Errorf("the gateway reported the subscription exists but listing it failed: %w", listErr)
-		}
-		if len(subs) == 1 {
-			log.Info("the gateway subscription already existed; adopting it",
-				slog.String("gateway_subscription_id", subs[0].ID))
-			return &subs[0], nil
-		}
-		return nil, permanentf("the gateway reported the subscription already exists and %d match API %q "+
-			"application %q — resolve the duplicate on the gateway first", len(subs), req.APIID, req.ApplicationID)
-	}
-
-	if apiErr.IsNotFound() {
-		m.resolver.invalidateAPI(resolved.cacheKey)
-		return nil, fmt.Errorf("the gateway no longer has API %q: %w", resolved.handle, err)
-	}
-	if apiErr.StatusCode < 500 {
-		return nil, permanentf("the gateway rejected the subscription create: %s", apiErr.Message)
-	}
-	return nil, fmt.Errorf("failed to create the gateway subscription: %w", err)
-}
-
 // handleSubscriptionUpdated applies a status change (ACTIVE <-> INACTIVE).
 func (m *Mediator) handleSubscriptionUpdated(ctx context.Context, env *webhook.Envelope, log *slog.Logger) error {
-	var data webhook.SubscriptionData
-	if err := env.DecodeData(&data); err != nil {
-		return permanentf("%v", err)
+	data, err := decodeSubscriptionData(env)
+	if err != nil {
+		return err
 	}
 	if strings.TrimSpace(data.Status) == "" {
 		return permanentf("data.status is required for %s", env.EventType)
 	}
 
-	record, err := m.locate(ctx, &data, log)
+	sub, err := m.requireSubscription(ctx, data, env.EventType)
 	if err != nil {
 		return err
 	}
 
 	status := normalizeStatus(data.Status)
-	if err := m.client.UpdateSubscriptionStatus(ctx, record.GatewaySubscriptionID, status); err != nil {
-		if apiErr, ok := gateway.AsAPIError(err); ok && apiErr.IsNotFound() {
-			if delErr := m.store.DeleteSubscription(record.PortalSubscriptionID); delErr != nil {
-				log.Warn("failed to forget the mapping for a subscription the gateway no longer has",
-					slog.Any("error", delErr))
-			}
-			return permanentf("the gateway no longer has subscription %s", record.GatewaySubscriptionID)
-		}
-		if apiErr, ok := gateway.AsAPIError(err); ok && apiErr.StatusCode < 500 {
-			return permanentf("the gateway rejected the status change: %s", apiErr.Message)
-		}
-		return fmt.Errorf("failed to update the gateway subscription status: %w", err)
-	}
-
-	record.Status = status
-	if err := m.store.PutSubscription(record); err != nil {
-		log.Warn("failed to persist the updated status", slog.Any("error", err))
+	if err := m.client.UpdateSubscription(ctx, sub.ID, gateway.SubscriptionUpdate{Status: &status}); err != nil {
+		return classifyUpdateError("status change", sub.ID, err)
 	}
 	log.Info("updated the gateway subscription status",
-		slog.String("gateway_subscription_id", record.GatewaySubscriptionID),
+		slog.String("gateway_subscription_id", sub.ID),
 		slog.String("status", status))
 	return nil
 }
 
-// handleSubscriptionPlanChanged applies a plan switch.
-//
-// The gateway's subscription update accepts only a status change, so the plan is
-// changed by deleting the subscription and recreating it with the same token
-// under the new plan. That is why the stored record keeps the token.
+// handleSubscriptionPlanChanged switches the subscription's plan in place. The
+// token is untouched, so the event does not need to carry it.
 func (m *Mediator) handleSubscriptionPlanChanged(ctx context.Context, env *webhook.Envelope, log *slog.Logger) error {
-	var data webhook.SubscriptionData
-	if err := env.DecodeData(&data); err != nil {
-		return permanentf("%v", err)
-	}
-
-	record, err := m.locate(ctx, &data, log)
+	data, err := decodeSubscriptionData(env)
 	if err != nil {
 		return err
 	}
-	if record.Token == "" {
-		return permanentf("cannot apply a plan change for portal subscription %s: the gateway has no "+
-			"plan-change operation, so the subscription must be recreated with its existing token, and no "+
-			"token is stored for it. Have the developer regenerate the subscription token instead",
-			record.PortalSubscriptionID)
-	}
-
-	planID, err := m.resolver.resolvePlan(ctx, &data.Plan)
-	if err != nil {
-		return err
-	}
-	return m.recreate(ctx, record, &data, record.Token, planID, log, "plan change")
-}
-
-// handleSubscriptionTokenRegenerated applies a token rotation. Like a plan
-// change this is a delete followed by a create, because the gateway stores only
-// the token's hash and offers no way to replace it in place.
-func (m *Mediator) handleSubscriptionTokenRegenerated(ctx context.Context, env *webhook.Envelope, log *slog.Logger) error {
-	var data webhook.SubscriptionData
-	if err := env.DecodeData(&data); err != nil {
-		return permanentf("%v", err)
-	}
-
-	token, err := m.subscriptionToken(env, &data)
-	if err != nil {
-		return err
-	}
-	record, err := m.locate(ctx, &data, log)
+	sub, err := m.requireSubscription(ctx, data, env.EventType)
 	if err != nil {
 		return err
 	}
 
-	planID := record.GatewayPlanID
-	if strings.TrimSpace(data.Plan.RefID) != "" || data.Plan.Display() != "" {
-		if resolvedPlanID, err := m.resolver.resolvePlan(ctx, &data.Plan); err == nil {
-			planID = resolvedPlanID
-		} else if !isPermanent(err) {
-			return err
-		}
-	}
-	return m.recreate(ctx, record, &data, token, planID, log, "token regeneration")
-}
-
-// recreate deletes the current gateway subscription and creates a replacement.
-//
-// The delete is recorded before the create is attempted, so a retry after a
-// partial failure resumes at the create rather than deleting again.
-func (m *Mediator) recreate(
-	ctx context.Context,
-	record *store.Subscription,
-	data *webhook.SubscriptionData,
-	token, planID string,
-	log *slog.Logger,
-	reason string,
-) error {
 	resolved, err := m.resolver.resolveAPI(ctx, &data.API)
 	if err != nil {
 		return err
 	}
-
-	if record.GatewaySubscriptionID != "" {
-		if err := m.client.DeleteSubscription(ctx, record.GatewaySubscriptionID); err != nil {
-			if apiErr, ok := gateway.AsAPIError(err); !ok || !apiErr.IsNotFound() {
-				return fmt.Errorf("failed to delete gateway subscription %s before recreating it for a %s: %w",
-					record.GatewaySubscriptionID, reason, err)
-			}
-		}
-		record.GatewaySubscriptionID = ""
-		if err := m.store.PutSubscription(record); err != nil {
-			return fmt.Errorf("deleted the gateway subscription for a %s but could not record it: %w", reason, err)
-		}
+	planID, err := m.resolver.resolvePlan(ctx, &data.Plan)
+	if err != nil {
+		return err
 	}
-
 	planName := data.Plan.Display()
 	if planID != "" && planName != "" {
-		var allowed bool
-		if resolved, allowed = m.planAllowed(ctx, resolved, planName, log); !allowed {
-			log.Warn("the new plan is not enabled for this gateway API; recreating without a plan",
-				slog.String("plan_name", planName))
+		if _, allowed := m.planAllowed(ctx, resolved, planName, log); !allowed {
+			log.Warn("the new plan is not enabled for this gateway API; clearing the subscription's plan",
+				slog.String("plan_name", planName), slog.String("gateway_api_handle", resolved.handle))
 			planID = ""
 		}
 	}
 
-	status := record.Status
-	if s := normalizeStatus(data.Status); s != "" {
-		status = s
+	err = m.client.UpdateSubscription(ctx, sub.ID, gateway.SubscriptionUpdate{SubscriptionPlanID: &planID})
+	if apiErr, ok := gateway.AsAPIError(err); ok && isPlanRejection(apiErr) && planID != "" {
+		log.Warn("the gateway rejected the new plan; clearing the subscription's plan",
+			slog.String("plan_name", planName), slog.String("gateway_message", apiErr.Message))
+		planID = ""
+		err = m.client.UpdateSubscription(ctx, sub.ID, gateway.SubscriptionUpdate{SubscriptionPlanID: &planID})
 	}
-	req := &gateway.SubscriptionCreateRequest{
-		APIID:              resolved.handle,
-		SubscriptionToken:  token,
-		ApplicationID:      record.ApplicationID,
-		SubscriptionPlanID: planID,
-		Status:             status,
+	if err != nil {
+		return classifyUpdateError("plan change", sub.ID, err)
 	}
-	created, err := m.createSubscription(ctx, req, planName, resolved, log)
+
+	log.Info("changed the gateway subscription's plan",
+		slog.String("gateway_subscription_id", sub.ID),
+		slog.String("gateway_plan_id", planID))
+	return nil
+}
+
+// handleSubscriptionTokenRegenerated replaces the subscription's token in
+// place. The event carries everything a create needs, so a subscription the
+// gateway does not have — its created delivery was lost — is created here.
+func (m *Mediator) handleSubscriptionTokenRegenerated(ctx context.Context, env *webhook.Envelope, log *slog.Logger) error {
+	data, err := decodeSubscriptionData(env)
+	if err != nil {
+		return err
+	}
+	token, err := m.subscriptionToken(env, data)
 	if err != nil {
 		return err
 	}
 
-	record.GatewaySubscriptionID = created.ID
-	record.GatewayAPIHandle = resolved.handle
-	record.GatewayPlanID = req.SubscriptionPlanID
-	record.PortalPlanRefID = strings.TrimSpace(data.Plan.RefID)
-	record.PortalPlanName = planName
-	record.Status = status
-	record.Token = token
-	if err := m.store.PutSubscription(record); err != nil {
-		return fmt.Errorf("recreated gateway subscription %s for a %s but could not persist the mapping: %w",
-			created.ID, reason, err)
+	sub, err := m.findSubscription(ctx, data.SubscriptionID)
+	if err != nil {
+		return err
+	}
+	if sub == nil {
+		log.Info("the gateway has no subscription to rotate the token of; creating it",
+			slog.String("portal_subscription_id", data.SubscriptionID))
+		return m.createSubscription(ctx, data, token, log)
 	}
 
-	log.Info("recreated the gateway subscription",
-		slog.String("reason", reason),
-		slog.String("gateway_subscription_id", created.ID),
-		slog.String("gateway_plan_id", req.SubscriptionPlanID),
-		slog.String("status", status))
+	if err := m.client.UpdateSubscription(ctx, sub.ID, gateway.SubscriptionUpdate{SubscriptionToken: &token}); err != nil {
+		return classifyUpdateError("token rotation", sub.ID, err)
+	}
+	log.Info("replaced the gateway subscription's token",
+		slog.String("gateway_subscription_id", sub.ID))
 	return nil
 }
 
 // handleSubscriptionDeleted removes the gateway subscription.
 func (m *Mediator) handleSubscriptionDeleted(ctx context.Context, env *webhook.Envelope, log *slog.Logger) error {
-	var data webhook.SubscriptionData
-	if err := env.DecodeData(&data); err != nil {
-		return permanentf("%v", err)
+	data, err := decodeSubscriptionData(env)
+	if err != nil {
+		return err
+	}
+	sub, err := m.findSubscription(ctx, data.SubscriptionID)
+	if err != nil {
+		return err
+	}
+	if sub == nil {
+		// Nothing to revoke; the end state is what the event asked for.
+		log.Info("the gateway has no such subscription; already in the desired state",
+			slog.String("portal_subscription_id", data.SubscriptionID))
+		return nil
 	}
 
-	record, ok := m.store.Subscription(data.SubscriptionID)
-	if !ok {
-		// Nothing mapped. Try to identify it on the gateway; if that is
-		// inconclusive there is nothing to revoke and the end state already holds.
-		adopted, err := m.adopt(ctx, &data, log)
-		if err != nil {
-			if isPermanent(err) {
-				log.Warn("no gateway subscription could be identified for a delete; nothing to revoke",
-					slog.String("portal_subscription_id", data.SubscriptionID))
-				return nil
-			}
-			return err
+	if err := m.client.DeleteSubscription(ctx, sub.ID); err != nil {
+		apiErr, ok := gateway.AsAPIError(err)
+		switch {
+		case ok && apiErr.IsNotFound():
+			// Deleted between the lookup and now.
+		case ok && apiErr.StatusCode < 500:
+			return permanentf("the gateway rejected the subscription delete: %s", apiErr.Message)
+		default:
+			return fmt.Errorf("failed to delete gateway subscription %s: %w", sub.ID, err)
 		}
-		record = adopted
-	}
-
-	if record.GatewaySubscriptionID != "" {
-		if err := m.client.DeleteSubscription(ctx, record.GatewaySubscriptionID); err != nil {
-			apiErr, ok := gateway.AsAPIError(err)
-			switch {
-			case ok && apiErr.IsNotFound():
-				// Already gone; the end state is what the event asked for.
-			case ok && apiErr.StatusCode < 500:
-				return permanentf("the gateway rejected the subscription delete: %s", apiErr.Message)
-			default:
-				return fmt.Errorf("failed to delete gateway subscription %s: %w", record.GatewaySubscriptionID, err)
-			}
-		}
-	}
-
-	if err := m.store.DeleteSubscription(record.PortalSubscriptionID); err != nil {
-		log.Warn("deleted the gateway subscription but failed to forget its mapping", slog.Any("error", err))
 	}
 	log.Info("deleted the gateway subscription",
-		slog.String("gateway_subscription_id", record.GatewaySubscriptionID))
+		slog.String("portal_subscription_id", data.SubscriptionID),
+		slog.String("gateway_subscription_id", sub.ID))
 	return nil
 }
 
-// locate finds the mediator's record, recovering from a missed create.
-func (m *Mediator) locate(ctx context.Context, data *webhook.SubscriptionData, log *slog.Logger) (*store.Subscription, error) {
-	if record, ok := m.store.Subscription(data.SubscriptionID); ok {
-		return record, nil
+// decodeSubscriptionData decodes and checks a subscription.* payload.
+func decodeSubscriptionData(env *webhook.Envelope) (*webhook.SubscriptionData, error) {
+	var data webhook.SubscriptionData
+	if err := env.DecodeData(&data); err != nil {
+		return nil, permanentf("%v", err)
 	}
-	return m.adopt(ctx, data, log)
+	data.SubscriptionID = strings.TrimSpace(data.SubscriptionID)
+	if data.SubscriptionID == "" {
+		return nil, permanentf("data.subscription_id is required")
+	}
+	return &data, nil
 }
 
-// adopt identifies an unmapped portal subscription on the gateway.
-//
-// The portal delivers each event exactly once with no retry, so a missed
-// subscription.created leaves later events with nothing to act on. When the API
-// and application narrow it to exactly one gateway subscription, that is
-// unambiguous enough to adopt.
-func (m *Mediator) adopt(ctx context.Context, data *webhook.SubscriptionData, log *slog.Logger) (*store.Subscription, error) {
-	resolved, err := m.resolver.resolveAPI(ctx, &data.API)
+// findSubscription looks a portal subscription up on the gateway by its
+// reference ID, returning nil when the gateway has none.
+func (m *Mediator) findSubscription(ctx context.Context, portalSubscriptionID string) (*gateway.Subscription, error) {
+	sub, err := m.client.FindSubscription(ctx, portalSubscriptionID)
+	if err != nil {
+		if apiErr, ok := gateway.AsAPIError(err); ok && apiErr.StatusCode < 500 {
+			return nil, permanentf("the gateway rejected the subscription lookup: %s", apiErr.Message)
+		}
+		return nil, fmt.Errorf("failed to look up the gateway subscription for %s: %w", portalSubscriptionID, err)
+	}
+	return sub, nil
+}
+
+// requireSubscription is findSubscription for an event that can only change an
+// existing subscription.
+func (m *Mediator) requireSubscription(ctx context.Context, data *webhook.SubscriptionData, eventType string) (*gateway.Subscription, error) {
+	sub, err := m.findSubscription(ctx, data.SubscriptionID)
 	if err != nil {
 		return nil, err
 	}
-	applicationID := strings.TrimSpace(data.ApplicationID)
-	subs, err := m.client.ListSubscriptions(ctx, resolved.handle, applicationID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list gateway subscriptions while identifying %s: %w",
-			data.SubscriptionID, err)
+	if sub == nil {
+		return nil, permanentf("cannot apply %s: the gateway has no subscription with reference ID %q. Its "+
+			"subscription.created delivery was probably missed (the API Portal does not redeliver). Have the "+
+			"developer regenerate the subscription token, which sends an event this mediator can create it from",
+			eventType, data.SubscriptionID)
 	}
-	if len(subs) != 1 {
-		return nil, permanentf("portal subscription %s is not mapped and %d gateway subscriptions match "+
-			"API %q application %q, so it cannot be identified. This happens when the subscription.created "+
-			"delivery was missed (the API Portal does not redeliver). Have the developer regenerate the "+
-			"subscription token to resend one this mediator can apply",
-			data.SubscriptionID, len(subs), resolved.handle, applicationID)
-	}
-
-	adopted := &store.Subscription{
-		PortalSubscriptionID:  data.SubscriptionID,
-		GatewaySubscriptionID: subs[0].ID,
-		GatewayAPIHandle:      resolved.handle,
-		GatewayPlanID:         subs[0].SubscriptionPlanID,
-		ApplicationID:         applicationID,
-		SubscriberID:          strings.TrimSpace(data.SubscriberID),
-		Status:                subs[0].Status,
-		APIName:               strings.TrimSpace(data.API.Name),
-		APIVersion:            strings.TrimSpace(data.API.Version),
-	}
-	if err := m.store.PutSubscription(adopted); err != nil {
-		return nil, fmt.Errorf("failed to persist the adopted mapping: %w", err)
-	}
-	log.Info("adopted an existing gateway subscription for an unmapped portal subscription",
-		slog.String("gateway_subscription_id", subs[0].ID))
-	return adopted, nil
+	return sub, nil
 }
 
 // subscriptionToken decrypts the token an event carries.
@@ -487,6 +372,26 @@ func (m *Mediator) subscriptionToken(env *webhook.Envelope, data *webhook.Subscr
 		return "", permanentf("the decrypted subscription token is empty")
 	}
 	return token, nil
+}
+
+// isPlanRejection reports the gateway refusing a plan for an API — its
+// allowlist or the plan's status.
+func isPlanRejection(apiErr *gateway.APIError) bool {
+	return apiErr.IsBadRequest() && strings.Contains(strings.ToLower(apiErr.Message), "subscription plan")
+}
+
+// classifyUpdateError turns a failed subscription update into a permanent or
+// transient error.
+func classifyUpdateError(action, subscriptionID string, err error) error {
+	if apiErr, ok := gateway.AsAPIError(err); ok {
+		if apiErr.IsNotFound() {
+			return permanentf("the gateway no longer has subscription %s for the %s", subscriptionID, action)
+		}
+		if apiErr.StatusCode < 500 {
+			return permanentf("the gateway rejected the %s: %s", action, apiErr.Message)
+		}
+	}
+	return fmt.Errorf("failed to apply the %s to gateway subscription %s: %w", action, subscriptionID, err)
 }
 
 // normalizeStatus maps a portal status onto one the gateway accepts. Statuses

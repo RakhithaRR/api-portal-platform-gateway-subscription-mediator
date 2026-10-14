@@ -28,7 +28,6 @@ services:
 
     volumes:
       - ./configs/config.toml:/app/config.toml:ro
-      - mediator-data:/app/data
 
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8085/health"]
@@ -39,9 +38,6 @@ services:
 
     networks:
       - mediator
-
-volumes:
-  mediator-data:
 
 networks:
   mediator:

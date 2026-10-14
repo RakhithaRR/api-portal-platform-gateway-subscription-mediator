@@ -25,11 +25,7 @@ secret:
   # Secrets Operator. Keys: webhook-secret, gateway-username, gateway-password.
   existingSecret: subscription-mediator-credentials
 
-persistence:
-  enabled: true
-  # AKS: managed-csi (Azure Disk) supports ReadWriteOncePod.
-  storageClass: managed-csi
-  size: 1Gi
+replicaCount: 2
 
 networkPolicy:
   enabled: true

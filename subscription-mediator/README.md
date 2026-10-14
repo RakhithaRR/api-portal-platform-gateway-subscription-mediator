@@ -19,8 +19,8 @@ may move a field or a path, and this service will not notice; it will just fail
 the event.
 
 > **This is built for a demo.** Not a WSO2 product, no warranty. The endpoints are
-> unauthenticated and plaintext, and both `configs/config.toml` and the state file 
-> hold secrets in the clear (unless you keep them in the environment — see Configuration).
+> unauthenticated and plaintext, and `configs/config.toml` holds secrets in the
+> clear (unless you keep them in the environment — see Configuration).
 > Run it where only the portal and you can reach it. Don't deploy it as-is, and don't
 > commit your filled-in `configs/config.toml`.
 
@@ -45,12 +45,17 @@ receiver to do something useful. This service is that receiver:
         ▼                                            │
   ┌──────────────────────────────────────────────────┴──┐
   │ subscription-mediator                               │
-  │  verify → decrypt → queue → apply                   │
+  │  verify → decrypt → apply → answer                  │
   └─────────────────────────────────────────────────────┘
 ```
 
 The gateway keeps getting its API definitions from API Manager. This service
 only adds the subscription and credential state the portal owns.
+
+It keeps no state of its own. Each delivery is applied to the gateway before
+the portal gets its answer, and every lookup reads the gateway: a subscription
+by the portal's subscription ID (its `referenceId` on the gateway), an API key
+by the portal's key ID (its `externalRefId`).
 
 ---
 
@@ -101,33 +106,57 @@ A healthy start logs:
 
 ```
 msg="the gateway management API is reachable and the credentials were accepted"
-msg="subscription-mediator is ready" workers=4 max_pending_events=5000
+msg="subscription-mediator is ready"
 msg="listening for API Portal webhooks" address=0.0.0.0:8085 path=/devportal/events
 ```
 
-If the gateway isn't up yet you get a warning instead of a failure — events are
-queued and applied once it answers.
+If the gateway isn't up yet you get a warning instead of a failure. Deliveries
+fail with `502` until it answers.
 
 ### Register it with the API Portal
 
-Registering a subscriber has no UI, so it is a `curl` — see
-[Configure webhooks](https://wso2.com/api-platform/docs/api-portal/1.0.0/admin-settings/webhook-integration/).
-Use the **same** `[webhook] secret`. Without a matching secret the portal omits
-the subscription token and API key value from its deliveries entirely, and the
+An admin registers it in the portal's settings
+([Configure webhooks](https://wso2.com/api-platform/docs/api-portal/1.0.0/admin-settings/webhook-integration/)):
+open `https://<portal-host>/api-portal/<org-handle>/settings`, choose
+**Webhooks** under **Integrations**, then **Add webhook**, and fill in:
+
+| Field | Value |
+|---|---|
+| Name | `Subscription Mediator` |
+| Target URL | `http://<host-reachable-from-the-portal>:8085/devportal/events` |
+| Secret | the same secret as `[webhook] secret` |
+| Timeout (ms) | `15000` |
+| Events | **Select all** under **Subscriptions** and under **API keys** |
+| Enabled | checked |
+
+Use the **same** secret. Without a matching secret the portal omits the
+subscription token and API key value from its deliveries entirely, and the
 mediator has nothing to give the gateway.
+
+The same thing over the portal's REST API, with an admin token:
 
 ```bash
 curl -k -X POST "https://localhost:9543/api-portal/api/v0.9/webhook-subscribers" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "displayName": "Platform gateway mediator",
+    "displayName": "Subscription Mediator",
     "targetUrl": "http://<host-reachable-from-the-portal>:8085/devportal/events",
     "secret": "<the same secret from configs/config.toml>",
     "events": ["subscription.*", "apikey.*"],
-    "timeoutMs": 5000
+    "timeoutMs": 15000
   }'
 ```
+
+Subscribers belong to one organization, and the portal delivers an event only to
+its own organization's subscribers. With more than one organization, register
+the mediator in each, all with the same secret: the mediator verifies every
+delivery against its one `[webhook] secret`.
+
+The mediator answers only once the gateway reflects the event, so `timeoutMs`
+has to cover the gateway calls: a create can take a few (find the API, the plan,
+then create). The portal's default of `5000` is tight; past it the portal marks
+the delivery `FAILED` even if the mediator finishes the job.
 
 Plain `http://` is fine — the portal doesn't validate the scheme and delivers to
 HTTP targets (its own delivery tests do exactly that). If you want TLS, put a
@@ -173,22 +202,10 @@ Everything else is plain Compose:
 docker compose up -d       # start; also picks up a freshly built image
 docker compose logs -f
 docker compose ps
-docker compose down        # stop, keeping the state volume
-docker compose down -v     # ...and delete the state volume
-```
-
-The container runs as UID/GID `10001`, not root. A state volume created by an
-older, root-running image is still root-owned and the service can no longer
-write to it; hand it over once (it keeps the mappings and queued events):
-
-```bash
 docker compose down
-docker run --rm -v subscription-mediator_mediator-data:/data alpine:3.24 chown -R 10001:10001 /data
-docker compose up -d
 ```
 
-A host directory mounted at `/app/data` instead of the volume needs the same
-ownership (`chown -R 10001:10001 <dir>`); on Kubernetes, set `fsGroup: 10001`.
+The container runs as UID/GID `10001`, not root, and writes nothing to disk.
 
 `configs/config.toml` is bind-mounted, so a configuration change needs only
 `docker compose restart` — no rebuild.
@@ -417,15 +434,15 @@ attached.
 ## Deploying to Kubernetes
 
 [`deploy/helm/subscription-mediator`](deploy/helm/subscription-mediator/README.md)
-is a Helm chart for Kubernetes 1.29+. It runs the mediator as a single-replica
-StatefulSet with its own persistent volume. The service has one state file and
-no leader election, so it must never run as two pods. The chart README covers:
+is a Helm chart for Kubernetes 1.29+. It runs the mediator as a Deployment with
+two replicas by default and no volume: the service keeps no state, so any pod
+can take any delivery, and a rolling restart or node drain leaves one to answer.
+The chart README covers:
 
 - the install;
 - credentials kept out of Helm;
 - network policy;
-- what an upgrade or a node drain costs. Webhooks that arrive while the pod is
-  down are lost, because the API Portal does not retry.
+- what an upgrade or a node drain costs.
 
 ```bash
 helm upgrade --install subscription-mediator deploy/helm/subscription-mediator \
@@ -455,9 +472,9 @@ level = "info"              # optional: debug | info | warn | error
 # "order api:v1.0" = "orangeapi-1.0.0"
 ```
 
-Anything else — worker count, retry budget, queue ceiling, the listen address,
-timeouts — is a constant in the source: `mediator.Workers`,
-`mediator.MaxAttempts`, `config.ListenAddress`, and so on. A demo has no reason
+Anything else — the listen address, the per-delivery time limit, the API cache
+lifetime — is a constant in the source: `config.ListenAddress`,
+`server.ApplyTimeout`, `mediator.APICacheTTL`, and so on. A demo has no reason
 to change them, and leaving them out keeps the file to what matters.
 
 Point the binary at a different file with `-config <path>`.
@@ -511,9 +528,19 @@ All unauthenticated.
 |---|---|
 | `POST /devportal/events` | the webhook receiver; this is the `targetUrl` |
 | `GET /health` | liveness, and the container healthcheck |
-| `GET /status` | queue depth, applied/failed counters, mapping counts |
-| `GET /failed` | events that exhausted every attempt, with the reason |
-| `POST /failed/requeue` | put them back on the queue after fixing the cause |
+| `GET /status` | events applied and failed since this process started |
+
+The webhook receiver answers once the event is applied:
+
+| Status | Meaning |
+|---|---|
+| `200` `{"status":"processed"}` | the gateway reflects the event (or there was nothing to do) |
+| `401` | the signature didn't verify |
+| `400` | the body isn't a webhook envelope |
+| `422` | the event can't be applied, and sending it again won't help; the body says why |
+| `502` | the gateway failed or couldn't be reached |
+
+Anything but `200` leaves the delivery `FAILED` in the portal's delivery history.
 
 ---
 
@@ -580,21 +607,26 @@ needs to reach it.
 
 | API Portal event | Gateway call |
 |---|---|
-| `subscription.created` | `POST /subscriptions` with the portal's own token |
-| `subscription.updated` | `PUT /subscriptions/{id}` (status only) |
-| `subscription.plan_changed` | `DELETE` + `POST /subscriptions` — see below |
-| `subscription.token_regenerated` | `DELETE` + `POST /subscriptions` with the new token |
+| `subscription.created` | `POST /subscriptions` with the portal's own token, and the portal's subscription ID as `referenceId` |
+| `subscription.updated` | `PUT /subscriptions/{id}` `{status}` |
+| `subscription.plan_changed` | `PUT /subscriptions/{id}` `{subscriptionPlanId}` — no token needed |
+| `subscription.token_regenerated` | `PUT /subscriptions/{id}` `{subscriptionToken}`; creates the subscription if the gateway has none |
 | `subscription.deleted` | `DELETE /subscriptions/{id}` |
-| `apikey.generated` | `POST /rest-apis/{api}/api-keys`, injecting the portal's key value |
-| `apikey.regenerated` | `PUT /rest-apis/{api}/api-keys/{name}` |
+| `apikey.generated` | `POST /rest-apis/{api}/api-keys`, injecting the portal's key value, with the portal's key ID as `externalRefId` |
+| `apikey.regenerated` | `PUT /rest-apis/{api}/api-keys/{name}`; creates the key if the gateway has none |
 | `apikey.revoked` | `DELETE /rest-apis/{api}/api-keys/{name}` |
+
+Every `{id}` comes from `GET /subscriptions?referenceId=<portal subscription ID>`,
+and every key `{name}` from `GET /rest-apis/{api}/api-keys`, matched on
+`externalRefId`. Nothing is remembered between events.
 | `application.*`, `apikey.application_updated` | acknowledged, no gateway call — the gateway has no application resource, and the key-to-app link is attribution only |
 
 Plans are matched by name against `GET /subscription-plans` and created when
 missing. A gateway API may also carry its own `spec.subscriptionPlans`
 allowlist, and the gateway rejects a subscription whose plan is not on it — so
 when the target plan is absent from the allowlist, the subscription is created
-or recreated **without a plan** rather than not at all. That keeps access
+**without a plan**, or a plan change clears its plan, rather than the event
+failing. That keeps access
 working, at the cost of the plan's rate limit, so the decision is never taken on
 a cached reading: the allowlist is cached for five minutes and an operator can
 widen it on the gateway with no event to announce the change, so a plan that
@@ -612,11 +644,27 @@ recorded as a permanent failure with that reason.
 
 ### Plan changes and token rotation
 
-The gateway's `PUT /subscriptions/{id}` accepts **only** a status change — there
-is no way to change a plan or replace a token in place, and the gateway stores
-only the token's hash. So both are applied as a delete followed by a create. A
-token rotation carries its new token; a plan change doesn't, which is why the
-state file keeps each subscription token.
+Both change the existing subscription in place, so its gateway ID stays the
+same and it never briefly disappears. A plan change sends only the new plan:
+the gateway keeps the token's hash, so the token the portal leaves out of
+`subscription.plan_changed` isn't needed. A token rotation sends the new token
+from the event.
+
+### Lost deliveries
+
+A status or plan change for a subscription the gateway doesn't have — its
+`subscription.created` delivery was lost — fails with `422` and says so. The fix
+is to regenerate the subscription token in the portal: that event carries
+everything a create needs, so the mediator creates the subscription from it.
+Likewise, an `apikey.regenerated` for a key the gateway doesn't have creates it.
+
+### Name clashes between API keys
+
+A gateway key name is the portal's key handle, slugified (`My Key` → `my-key`).
+Two handles can slugify alike, and a revoked key keeps its name on the gateway,
+so when the name is already taken on that API the start of the portal key ID is
+appended (`my-key-3f9a1c2b`). Rotations and revocations find the key by
+`externalRefId`, never by name, so they always reach the right one.
 
 ---
 
@@ -627,60 +675,153 @@ because its APIs came from API Manager. So matching is on display name and
 version, tried in this order:
 
 1. An `[api_handles]` entry in `configs/config.toml`.
-2. A mapping resolved earlier and persisted.
+2. A resolution from the last five minutes, kept in memory.
 3. `GET /rest-apis?displayName=<name>&version=<version>` — the exact match.
 4. A scan of the full list, folding case, spacing and punctuation, so
    `Order API` matches `order-api`, `OrderAPI` or `Order-API`.
 5. The gateway's own handle convention, `<slugified-name>-<version>`.
 
 Versions aren't guessed at: portal `v1.0` against gateway `1.0.0` doesn't match,
-because those are different versions. When nothing resolves the event fails
-permanently and says what to add:
+because those are different versions. When nothing resolves, the delivery fails
+with `422` and the log says what to add:
 
 ```bash
-curl -s localhost:8085/failed | jq
+docker compose logs subscription-mediator | grep "cannot be applied"
 #  -> no gateway REST API matches portal API "Order API" version "v1.0"; deploy it
 #     to the gateway first, or pin it in configs/config.toml with
 #     [api_handles] "order api:v1.0" = "<gateway-api-handle>"
 ```
 
-Add it under `[api_handles]` in `configs/config.toml`, then:
-
-```bash
-docker compose restart
-curl -s -X POST localhost:8085/failed/requeue
-```
+Add it under `[api_handles]` in `configs/config.toml`, run
+`docker compose restart`, then repeat the action in the portal so it sends the
+event again.
 
 ---
 
-## Delivery and retries
+## Delivery and failures
 
 **The API Portal attempts each delivery exactly once — no retry, no dead-letter
 queue.** A failed delivery is marked `FAILED` in the portal and never resent.
-Hence:
+This service doesn't retry either. Instead:
 
-- A verified event is written to the state file and fsync'd **before** the
-  mediator returns `202`, so a restart between accepting and applying loses
-  nothing. That's what the `mediator-data` volume is for.
-- A gateway that's down or slow doesn't cost you the event: it stays queued and
-  is retried with exponential backoff, up to 6 attempts.
-- The queue is capped at 5000 pending events; past that the endpoint returns
-  `503` rather than growing without limit.
-- Events for one subscription (or one API key) are routed to the same worker
-  lane and applied in order, so a create and the delete after it can't cross.
-  Unrelated subscriptions run concurrently across 4 lanes.
-- Each `event_id` is applied once, and that survives a restart. Beyond that the
-  handlers converge: a duplicate create adopts the existing subscription, a
-  delete of something already gone is success, and a rotate whose create was
-  missed creates the key.
-- A permanent failure (unresolvable API, unsupported kind, a request the gateway
-  rejects) is retired immediately rather than burning the retry budget. See
-  `GET /failed`.
+- Each delivery is applied before it is answered, so `200` means the gateway
+  already reflects it, and anything else means it doesn't. Nothing is accepted
+  and then lost.
+- A failure shows up in the portal's delivery history, which lists every
+  delivery that didn't get a `2xx`. Fix the cause, then repeat the action in
+  the portal so it sends a new event:
 
-If a `subscription.created` delivery is missed entirely, the mediator can adopt
-the matching gateway subscription when a later event arrives — but it can't
-invent a token it never received. The fix is to regenerate the subscription
-token in the portal, which sends a fresh event the mediator can apply in full.
+  ```bash
+  curl -sk "$PORTAL/webhook-subscribers/<subscriber-id>/deliveries" \
+    -H "Authorization: Bearer $TOKEN" \
+    | jq -r '.list[] | select(.status != "DELIVERED")
+             | "\(.occurredAt) \(.eventType) \(.status) \(.lastError)"'
+  ```
+
+- A gateway that's down or slow fails the delivery (`502`). The portal's
+  `timeoutMs` bounds how long it waits, and the mediator spends at most 25
+  seconds on one delivery.
+- If the portal gives up waiting, the mediator still finishes the job. The
+  portal then shows `FAILED` for an event that did apply; repeating it is safe.
+- Repeats converge: a duplicate create finds the subscription by its
+  `referenceId`, the same `PUT` twice changes nothing, a delete of something
+  already gone is success, and a regenerate whose generate was lost creates the
+  key.
+- Events for one subscription (or one API key) arriving together are applied one
+  after the other within a pod. Unrelated ones run concurrently.
+
+`GET /status` counts what this process applied and failed since it started. With
+several replicas each pod counts its own.
+
+---
+
+## Compared with the Platform API
+
+In a native setup the Platform API receives the same portal webhooks and does
+this job itself. The comparison below is from the code: this service, and
+[`wso2/api-platform` at `eb7dcaba9`](https://github.com/wso2/api-platform/tree/eb7dcaba9ab54924e66e3ebfbbbfc1cbf8ecce57)
+(`main`, 2026-10-14). The gateway behaviour it relies on was also checked
+against the `gateway/v1.2.0` tag. Paths starting with `platform-api/` or
+`gateway/` are in that repository.
+
+- **This service:** API Portal → webhook → mediator → gateway management REST
+  API. The gateway's control plane is API Manager.
+- **Native:** API Portal → webhook → Platform API, which writes to its own
+  database and publishes to a SQL-backed event hub (`common/eventhub/`). The
+  event reaches the gateway over its control-plane WebSocket. The Platform API
+  *is* the gateway's control plane.
+
+### Receiving the webhook
+
+| | This service | Platform API |
+|---|---|---|
+| Signature check | HMAC over the raw body, with a time tolerance | Same (`platform-api/internal/webhook/receiver.go`, `ReceiveEvent`) |
+| When it replies | **`200` once the gateway reflects the event**, in the same request | **`200` after the event is handled**, in the same request |
+| On failure | `401` / `400` / `422` (can't be applied) / `502` (gateway failed) | An error status: `4xx` for a bad envelope or decryption, `5xx` for storage errors. The portal never retries either |
+| Duplicates | No `event_id` check. Each handler converges on the gateway's state | No `event_id` check. Each handler is idempotent "by domain identity" |
+| Retries | None. The failure goes back to the portal, which marks the delivery `FAILED` | None. Same |
+| Ordering | Events for one subscription or key arriving together run one after the other within a pod | Nothing explicit. Each delivery is handled in its own request |
+
+### Finding the API and the plan
+
+| | This service | Platform API |
+|---|---|---|
+| API | The portal's `ref_id` is unknown to an API Manager-fed gateway, so: override, in-memory cache, then **search by name and version** | `ref_id` is the Platform API's own artifact handle, looked up by handle and kind |
+| Plan | Gateway plan **by name**, else **create the plan**. If the gateway rejects the plan, the subscription goes without one | Looked up by handle. **A missing plan fails the event** (`SubscriptionPlanNotFound`). Plans are never created |
+
+### Subscriptions
+
+| | This service | Platform API |
+|---|---|---|
+| Identity | **The portal's `subscription_id`**, stored on the gateway subscription as its `referenceId` | **API + `subscriber_id`**, one subscription per pair (`FindByArtifactKindAndSubscriber`). The portal's `subscription_id` isn't used |
+| ID on the gateway | Generated by the gateway, and looked up by `referenceId` | **The Platform API's UUID.** The gateway looks subscriptions up by it |
+| Token at rest | **Not kept.** Only the gateway's hash exists | **AES-256-GCM encrypted**, with a hash for lookups (`platform-api/internal/repository/subscription_repository.go`) |
+| `created` | `POST /subscriptions` with the portal's token | Saved with the portal's token, then `subscription.created` is sent to every gateway the API is deployed on |
+| `updated` (status) | `PUT /subscriptions/{id}` `{status}` | Database update, then `subscription.updated` with the full record |
+| `plan_changed` | `PUT /subscriptions/{id}` `{subscriptionPlanId}`, **in place, no token needed** | Database update, then `subscription.updated` carrying the token and new plan. **The gateway updates in place** (`handleSubscriptionUpdatedEvent` in `gateway/gateway-controller/pkg/controlplane/client.go`) |
+| `token_regenerated` | `PUT /subscriptions/{id}` `{subscriptionToken}`, in place; creates a missing subscription | Database update, then `subscription.updated` |
+| `deleted` | `DELETE`; nothing found counts as success | Database delete, then broadcast. Already gone counts as success |
+
+### API keys and applications
+
+| | This service | Platform API |
+|---|---|---|
+| Gateway key name | The handle, slugified, with a key-ID suffix when the name is taken. Found later by `externalRefId` | The handle as-is; keys are unique by artifact + name |
+| Duplicate generate | Finds the key by `externalRefId` and sets the same value again | A unique-constraint violation counts as success |
+| `apikey.application_updated` | **Ignored** (logged and acknowledged) | Handled |
+| `application.*` | Ignored. The gateway has no application resource | Handled |
+
+### Reaching the gateway and recovering missed changes
+
+| | This service | Platform API |
+|---|---|---|
+| Call to the gateway | Synchronous REST with basic auth | Publish to the event hub, delivered over the gateway's WebSocket |
+| Gateway down | `502`; the portal marks the delivery `FAILED` | The publish error is **logged only**; the webhook still returns `200` |
+| Gateway catching up | **Not possible.** The gateway skips its subscription resync for an on-prem control plane (`syncSubscriptionsForExistingAPIs`) | On every connect and reconnect the gateway pulls all plans and subscriptions from the Platform API |
+| Portal delivery lost | Lost; redo the action in the portal | **Also lost**; same one-attempt webhook |
+
+### State and deployment
+
+| | This service | Platform API |
+|---|---|---|
+| Storage | **None.** Every lookup reads the gateway | A SQL database; the event hub is SQL-backed too |
+| Contents | — | Its full domain model (APIs, plans, subscriptions, keys, applications), tokens encrypted |
+| Replicas | Any number; the chart defaults to two | Not tied to a local file. Its multi-replica deployment wasn't checked here |
+
+### What the differences come down to
+
+1. **Who owns the gateway's state.** The Platform API is the gateway's control
+   plane: it picks the IDs, pushes full records, and the gateway resyncs from
+   it. This service is an outside client of a gateway API Manager owns, hence
+   the reference IDs and the name-based API matching.
+2. **Where failures are absorbed.** Both handle the event in the request. The
+   Platform API's own write always succeeds and the gateway resyncs from it
+   later; this service reports a gateway failure straight back to the portal,
+   where the action has to be repeated. Neither can recover a portal delivery
+   that never arrived.
+3. **What is stored.** The Platform API keeps a decryptable copy of every token.
+   This service keeps nothing, which the in-place plan update makes possible:
+   a plan change no longer needs the token.
 
 ---
 
@@ -688,7 +829,7 @@ token in the portal, which sends a fresh event the mediator can apply in full.
 
 ```
 Dockerfile                   build context is THIS directory
-.dockerignore                keeps .env, configs/ and local state out of it
+.dockerignore                keeps .env and configs/ out of it
 docker-compose.yaml          how it runs
 configs/config.toml          all configuration; mounted read-only
 configs/config-template.toml the annotated version to copy from
@@ -698,8 +839,7 @@ cmd/subscription-mediator/   startup and wiring
 internal/config/             file + env loading, validation, fixed constants
 internal/webhook/            envelope, HMAC verification, AES-256-GCM decryption
 internal/gateway/            management REST API client
-internal/mediator/           event translation, worker lanes, retry
-internal/store/              durable mappings, idempotency ledger, pending queue
+internal/mediator/           event translation, lookups by reference ID
 internal/server/             HTTP endpoints
 ```
 

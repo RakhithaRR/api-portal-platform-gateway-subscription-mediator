@@ -67,8 +67,8 @@ level = "info"
 # different version string, say: portal "v1.0" against gateway "1.0.0").
 #
 # Keys are matched case-insensitively and may be "<name>:<version>" or the
-# portal's api ref_id. GET /failed names the exact key to add when a resolution
-# fails.
+# portal's api ref_id. When a resolution fails, the error in the log and in the
+# webhook response names the exact key to add.
 [api_handles]
 # "order api:v1.0" = "orderapi-1.0.0"
 # "echo api:1.0.0" = "echo-api-1-0-0"

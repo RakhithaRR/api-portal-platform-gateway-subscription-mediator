@@ -41,10 +41,6 @@ const (
 	// API Portal.
 	WebhookPath = "/devportal/events"
 
-	// StatePath is the durable state: identifier mappings, the processed-event
-	// ledger, and the pending queue.
-	StatePath = "/app/data/state.jsonl"
-
 	// MaxBodyBytes caps a single delivery body. Events are a few KB.
 	MaxBodyBytes = 1 << 20
 )

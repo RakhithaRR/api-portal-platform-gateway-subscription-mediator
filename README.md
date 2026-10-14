@@ -59,7 +59,7 @@ replays them onto the gateway's management REST API.
            ▼                                  │
      ┌────────────────────────────────────────┴──┐
      │            subscription-mediator          │
-     │       verify → decrypt → queue → apply    │
+     │       verify → decrypt → apply → answer   │
      └───────────────────────────────────────────┘
 ```
 
@@ -462,7 +462,7 @@ A healthy start logs:
 
 ```
 msg="the gateway management API is reachable and the credentials were accepted"
-msg="subscription-mediator is ready" workers=4 max_pending_events=5000
+msg="subscription-mediator is ready"
 msg="listening for API Portal webhooks" address=0.0.0.0:8085 path=/devportal/events
 ```
 
@@ -501,10 +501,13 @@ curl -sk -X POST "$PORTAL/webhook-subscribers" \
 `localhost:8085` if the portal is on the host, or the machine's routable address
 if it's elsewhere.
 
-`timeoutMs` defaults to `5000`, which is tighter than it looks: the portal gives
-up after one attempt, and the mediator's first connection after some idle
-minutes can take longer than that through Docker Desktop's
-`host.docker.internal`. Raising it costs nothing and prevents a dropped event.
+`timeoutMs` defaults to `5000`, which is tighter than it looks. The mediator
+answers a delivery only once the gateway reflects it, so the whole apply — an
+API lookup, maybe a plan lookup or create, then the subscription or key call —
+happens inside that window. The portal gives up after one attempt, and the
+mediator's first connection after some idle minutes can take longer than 5s
+through Docker Desktop's `host.docker.internal`. Raising it costs nothing and
+prevents a dropped event.
 
 > The secret does double duty: it signs each delivery *and* derives the key that
 > encrypts the subscription token and API key inside it. If it doesn't match, the
@@ -586,16 +589,17 @@ Full UI reference:
 [Secured API End to End](https://wso2.com/api-platform/docs/api-portal/1.0.0/tutorials/secured-api-end-to-end/)
 step 6, with the mediator standing in for the Platform API connection.
 
-Each action fires a webhook the mediator applies within a few seconds. Watch it
-land:
+Each action fires a webhook the mediator applies before it answers the portal.
+Watch it land:
 
 ```bash
 curl -s localhost:8085/status | jq
 curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/subscriptions" | jq
 ```
 
-`applied` should climb by one per action and `failed` stay at `0`. The mediator
-log names what it did:
+`events.applied` should climb by one per action and `events.failed` stay at
+`0`. The counters are in memory, per mediator process, since it started. The
+mediator log names what it did:
 
 ```
 msg="resolved portal API to gateway API" portal_api="Reading List API v1" gateway_api_handle=reading-list-api-v1
@@ -700,9 +704,9 @@ Verified: a key that returned `200` immediately before a
 **Subscriptions are not affected** — they survive the restart intact. Only API
 keys are lost.
 
-There is nothing for the mediator to retry: those events succeeded, and the
-revocation happened afterwards on the gateway side, so `/failed` stays empty and
-`/failed/requeue` is a no-op. Recover by generating a fresh key in the portal,
+There is nothing for the mediator to redo: those events succeeded, and the
+revocation happened afterwards on the gateway side, so the portal shows them as
+delivered and the mediator logged no failure. Recover by generating a fresh key in the portal,
 which fires a new `apikey.generated` the mediator applies. Plan around it: avoid
 restarting the gateway mid-demo, and re-issue keys after any restart.
 
@@ -712,7 +716,8 @@ Three identifiers, translated twice:
 
 1. **Portal → gateway handle.** The portal's webhook carries `api.ref_id` (a
    control-plane UUID), `name` and `version`. The mediator tries, in order: an
-   `[api_handles]` pin in its config, a mapping it resolved earlier, an exact
+   `[api_handles]` pin in its config, a resolution cached in memory for five
+   minutes, an exact
    `displayName`+`version` query, then a full-list scan folding case, spacing and
    punctuation. More than one match is a permanent failure, never a guess.
 2. **Handle → gateway id.** The mediator sends the handle; the gateway resolves
@@ -723,16 +728,20 @@ Three identifiers, translated twice:
 Versions are not guessed at: portal `v1.0` against gateway `1.0.0` will not
 match, because those are different versions. Use `spec.referenceId` in the
 portal's `api.yaml` — or an `[api_handles]` pin — to be explicit. When nothing
-resolves, `GET /failed` on the mediator names the exact line to add.
+resolves, the error in the mediator log — and in its `422` answer, which the
+portal records against the delivery — names the exact line to add.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
-| `rejected an unverified webhook delivery` in the mediator log | the secret in the portal's subscriber doesn't match the mediator's. Re-register the subscriber with the right secret, then `POST localhost:8085/failed/requeue` |
-| `401 Valid API key required` with a fresh key | the event never reached the gateway — check `GET /status` and `GET /failed` on the mediator |
+| `rejected an unverified webhook delivery` in the mediator log | the secret in the portal's subscriber doesn't match the mediator's. Re-register the subscriber with the right secret, then repeat the portal actions that failed |
+| `401 Valid API key required` with a fresh key | the event never reached the gateway — check the portal's delivery history (below) and `events.failed` in `GET /status` on the mediator |
+| A delivery `FAILED` with HTTP `502` | the mediator could not reach the gateway, or the gateway failed. Fix that, then repeat the portal action |
+| A delivery `FAILED` with HTTP `422` | the event cannot be applied as it stands; the mediator log says why and what to change |
+| `the gateway has no subscription with reference ID ...` | the subscription's `created` delivery was lost, or the gateway lacks the `referenceId` change (see [Versions](#versions)). Have the developer regenerate the subscription token, which creates it |
 | Calls succeed but are never throttled | the gateway plan has no `throttleLimitCount`/`throttleLimitUnit` — see step 10 |
-| `no gateway REST API matches portal API ...` | name/version mismatch. Pin it under `[api_handles]`, restart, requeue |
+| `no gateway REST API matches portal API ...` | name/version mismatch. Pin it under `[api_handles]`, restart the mediator, repeat the portal action |
 | Mediator container `Exited` right after start | a required setting is missing; the reason is its last log line |
 | Gateway logs `WebSocket connection failed ... dial tcp 172.17.0.1:9444: connect: connection refused` | the `extra_hosts` trap — point `APIP_GW_CONTROLLER_CONTROLPLANE_HOST` at `$HOST_ADDR`, not `host.docker.internal` |
 | A CP-created API answers without credentials | its policies aren't attached, or weren't redeployed — see step 6; **API Security / `securityScheme` does nothing** for a platform-gateway API |
@@ -742,15 +751,17 @@ resolves, `GET /failed` on the mediator names the exact line to add.
 | APIM won't start: `Unrecognized option: --enable-native-access` | JDK 11 on `JAVA_HOME`; 4.7.0 needs 17+ |
 
 The API Portal **attempts each delivery exactly once** — there is no retry and no
-dead-letter queue on its side. Anything the mediator rejects is marked `FAILED`
-in the portal and never resent, which is why the mediator persists every accepted
-event before acknowledging it, and why `/failed/requeue` exists.
+dead-letter queue on its side. The mediator keeps no queue either: it applies
+each event before answering, `200` once the gateway reflects it, `422` when the
+event cannot be applied, `502` when the gateway failed. Anything but `200` is
+marked `FAILED` in the portal and never resent, so the portal's delivery history
+is the record of what didn't land.
 
 A delivery can also be marked `FAILED` **without the mediator ever seeing it** —
-a connection timeout, most likely. The mediator then has nothing to requeue, and
-its own counters stay clean: `/status` reports `failed: 0` and `/failed` is
-empty while a portal action has in fact been lost, leaving the gateway out of
-sync with nothing to reconcile it. Only the portal knows:
+a connection timeout, most likely. The mediator's counters then stay clean —
+`/status` reports `events.failed: 0` — while a portal action has in fact been
+lost, leaving the gateway out of sync with nothing to reconcile it. Only the
+portal knows:
 
 ```bash
 curl -sk "$PORTAL/webhook-subscribers/subscription-mediator/deliveries" \
@@ -800,15 +811,15 @@ build's ports, `scripts/setup.sh` flags and `configs/config-template.toml`.
 ## Notes
 
 - This is a demo project, not a WSO2 product — no affiliation, no endorsement, no support, no warranty.
-- **Version-locked.** API Manager 4.7.0, API Platform Gateway 1.2.0, API Portal
-  1.0.0. Other combinations are untested; see [Versions](#versions).
+- **Version-locked.** API Manager 4.7.0, API Platform Gateway 1.2.0,
+  API Portal 1.0.0. Other combinations are untested; see [Versions](#versions).
 - Everything here runs over plaintext HTTP and self-signed TLS (`curl -k`), and
   the mediator's own endpoints are unauthenticated. It's a demo — run it where
   only you and the portal can reach it.
 - The mediator only handles `RestApi` artifacts. The gateway's subscription and
   API-key endpoints reject every other kind.
 - Full operational detail — configuration precedence, networking matrix,
-  per-event behaviour, retries, state — is in
+  per-event behaviour, failure handling — is in
   [`subscription-mediator/README.md`](subscription-mediator/README.md).
 - [`agent-verification.md`](agent-verification.md) drives the same flow entirely
   over REST, with expected results for every subscription and API-key operation

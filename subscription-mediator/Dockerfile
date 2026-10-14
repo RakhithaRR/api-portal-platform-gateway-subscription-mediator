@@ -26,8 +26,7 @@ FROM alpine:3.24
 # ca-certificates for an HTTPS gateway; wget (busybox) backs the healthcheck.
 #
 # The service runs as an unprivileged user with a fixed numeric UID/GID, so
-# Kubernetes `runAsNonRoot` can verify it and a host directory mounted at
-# /app/data can be chowned to match (10001:10001).
+# Kubernetes `runAsNonRoot` can verify it (10001:10001).
 RUN apk add --no-cache ca-certificates \
  && addgroup -S -g 10001 mediator \
  && adduser -S -D -H -u 10001 -G mediator -h /app -s /sbin/nologin mediator
@@ -38,12 +37,8 @@ COPY --from=build /out/subscription-mediator /app/subscription-mediator
 # config.toml is bind-mounted at run time; the image ships without one so it
 # cannot start with a stale or half-filled copy baked in.
 #
-# Mount a volume at /app/data to keep the mappings and the pending event queue
-# across restarts. Without it a restart loses the queue, and the API Portal
-# never redelivers. /app/data is the only path the service writes, and the only
-# one the service user owns; the binary stays root-owned and read-only to it.
-RUN mkdir -p /app/data && chown 10001:10001 /app/data
-
+# The service keeps no state and writes nothing to disk; the binary stays
+# root-owned and read-only to the service user.
 USER 10001:10001
 
 EXPOSE 8085

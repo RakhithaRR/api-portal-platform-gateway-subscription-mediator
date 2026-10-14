@@ -10,7 +10,6 @@ import (
 	"unicode"
 
 	"subscription-mediator/internal/gateway"
-	"subscription-mediator/internal/store"
 	"subscription-mediator/internal/webhook"
 )
 
@@ -41,7 +40,6 @@ type resolvedAPI struct {
 // is on the API's display name and version, against the gateway's own API list.
 type resolver struct {
 	client    *gateway.Client
-	store     *store.Store
 	overrides map[string]string
 	logger    *slog.Logger
 
@@ -49,10 +47,9 @@ type resolver struct {
 	apiCache map[string]resolvedAPI
 }
 
-func newResolver(client *gateway.Client, st *store.Store, overrides map[string]string, logger *slog.Logger) *resolver {
+func newResolver(client *gateway.Client, overrides map[string]string, logger *slog.Logger) *resolver {
 	return &resolver{
 		client:    client,
-		store:     st,
 		overrides: overrides,
 		logger:    logger,
 		apiCache:  map[string]resolvedAPI{},
@@ -84,20 +81,7 @@ func (r *resolver) resolveAPI(ctx context.Context, ref *webhook.APIRef) (resolve
 	}
 	r.mu.Unlock()
 
-	// 3. A resolution persisted by an earlier run.
-	if handle, ok := r.store.APIMapping(cacheKey); ok && handle != "" {
-		resolved, err := r.describeHandle(ctx, handle, cacheKey)
-		if err == nil {
-			return resolved, nil
-		}
-		if !isPermanent(err) {
-			return resolvedAPI{}, err
-		}
-		r.logger.Info("stored API mapping no longer resolves on the gateway; re-resolving",
-			slog.String("portal_api_ref", cacheKey), slog.String("stale_handle", handle))
-	}
-
-	// 4. Resolve against the gateway's API list.
+	// 3. Resolve against the gateway's API list.
 	handle, planNames, err := r.search(ctx, ref)
 	if err != nil {
 		return resolvedAPI{}, err
@@ -105,11 +89,6 @@ func (r *resolver) resolveAPI(ctx context.Context, ref *webhook.APIRef) (resolve
 
 	resolved := resolvedAPI{handle: handle, planNames: planNames, cacheKey: cacheKey, at: time.Now()}
 	r.cache(cacheKey, resolved)
-	if err := r.store.PutAPIMapping(cacheKey, handle); err != nil {
-		// The mapping is a cache, not the source of truth: failing to persist it
-		// costs a re-resolution later, so it must not fail the event.
-		r.logger.Warn("failed to persist the API mapping", slog.Any("error", err))
-	}
 	r.logger.Info("resolved portal API to gateway API",
 		slog.String("portal_api", ref.Name+" "+ref.Version),
 		slog.String("gateway_api_handle", handle))
@@ -273,54 +252,24 @@ func planEnabledForAPI(resolved resolvedAPI, planName string) bool {
 	return false
 }
 
-// resolvePlan maps a portal plan reference onto a gateway plan ID, creating the
+// resolvePlan maps a portal plan onto a gateway plan ID by name, creating the
 // plan when the gateway does not have it.
 //
 // It returns an empty ID with a nil error when the plan cannot be mapped — the
-// subscription is then created on the gateway's default limits rather than not
-// at all, which keeps access working.
+// subscription then runs on the gateway's default limits rather than not at
+// all, which keeps access working.
 func (r *resolver) resolvePlan(ctx context.Context, plan *webhook.PlanRef) (string, error) {
-	refID := strings.TrimSpace(plan.RefID)
 	planName := plan.Display()
-	if refID == "" && planName == "" {
-		return "", nil
-	}
-
-	// A mapping from an earlier resolution, re-checked so a plan deleted on the
-	// gateway does not keep being referenced.
-	if refID != "" {
-		if id, ok := r.store.PlanMapping(refID); ok && id != "" {
-			_, err := r.client.GetSubscriptionPlan(ctx, id)
-			if err == nil {
-				return id, nil
-			}
-			if apiErr, ok := gateway.AsAPIError(err); ok && apiErr.IsNotFound() {
-				r.logger.Info("the mapped gateway plan no longer exists; re-resolving",
-					slog.String("gateway_plan_id", id))
-				if err := r.store.DeletePlanMapping(refID); err != nil {
-					r.logger.Warn("failed to forget the stale plan mapping", slog.Any("error", err))
-				}
-			} else {
-				return "", fmt.Errorf("failed to verify the gateway subscription plan: %w", err)
-			}
-		}
-	}
-
 	if planName == "" {
-		r.logger.Warn("the plan reference carries no name; the subscription will use the gateway's default limits")
+		if strings.TrimSpace(plan.RefID) != "" {
+			r.logger.Warn("the plan reference carries no name; the subscription will use the gateway's default limits")
+		}
 		return "", nil
 	}
 
 	// Match an existing gateway plan by name.
-	plans, err := r.client.ListSubscriptionPlans(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to list the gateway's subscription plans: %w", err)
-	}
-	for i := range plans {
-		if strings.EqualFold(plans[i].PlanName, planName) {
-			r.rememberPlan(refID, plans[i].ID)
-			return plans[i].ID, nil
-		}
+	if id, err := r.findPlan(ctx, planName); err != nil || id != "" {
+		return id, err
 	}
 
 	// Create it.
@@ -329,30 +278,30 @@ func (r *resolver) resolvePlan(ctx context.Context, plan *webhook.PlanRef) (stri
 		// A concurrent create loses the race and comes back 409; the winner's
 		// plan is what both should use.
 		if apiErr, ok := gateway.AsAPIError(err); ok && apiErr.IsConflict() {
-			if plans, listErr := r.client.ListSubscriptionPlans(ctx); listErr == nil {
-				for i := range plans {
-					if strings.EqualFold(plans[i].PlanName, planName) {
-						r.rememberPlan(refID, plans[i].ID)
-						return plans[i].ID, nil
-					}
-				}
+			if id, findErr := r.findPlan(ctx, planName); findErr == nil && id != "" {
+				return id, nil
 			}
 		}
 		return "", fmt.Errorf("failed to create the gateway subscription plan %q: %w", planName, err)
 	}
 	r.logger.Info("created a gateway subscription plan for the portal plan",
 		slog.String("plan_name", planName), slog.String("gateway_plan_id", created.ID))
-	r.rememberPlan(refID, created.ID)
 	return created.ID, nil
 }
 
-func (r *resolver) rememberPlan(refID, gatewayPlanID string) {
-	if refID == "" || gatewayPlanID == "" {
-		return
+// findPlan returns the ID of the gateway plan named planName, or "" when there
+// is none.
+func (r *resolver) findPlan(ctx context.Context, planName string) (string, error) {
+	plans, err := r.client.ListSubscriptionPlans(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to list the gateway's subscription plans: %w", err)
 	}
-	if err := r.store.PutPlanMapping(refID, gatewayPlanID); err != nil {
-		r.logger.Warn("failed to persist the plan mapping", slog.Any("error", err))
+	for i := range plans {
+		if strings.EqualFold(plans[i].PlanName, planName) {
+			return plans[i].ID, nil
+		}
 	}
+	return "", nil
 }
 
 // normalizeName folds a display name to letters and digits in lower case, so

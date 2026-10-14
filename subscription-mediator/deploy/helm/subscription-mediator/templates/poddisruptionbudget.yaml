@@ -1,8 +1,6 @@
 {{- if .Values.podDisruptionBudget.enabled }}
-# With one replica this blocks every voluntary eviction (node drains, cluster
-# upgrades) until someone deletes the pod by hand. That is the point: the API
-# Portal never redelivers a webhook, so an unplanned gap loses events. Enable
-# it when you would rather a drain wait for a planned window.
+# Keeps a drain or cluster upgrade from taking every replica down at once: the
+# API Portal never redelivers a webhook, so a delivery that finds no pod fails.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -11,7 +9,7 @@ metadata:
   labels:
     {{- include "subscription-mediator.labels" . | nindent 4 }}
 spec:
-  maxUnavailable: 0
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
   selector:
     matchLabels:
       {{- include "subscription-mediator.selectorLabels" . | nindent 6 }}

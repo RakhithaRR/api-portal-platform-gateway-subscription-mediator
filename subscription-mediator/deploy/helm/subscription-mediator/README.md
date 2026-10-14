@@ -8,12 +8,11 @@ REST API, on Kubernetes 1.29 or later.
 
 | Resource | Notes |
 |---|---|
-| StatefulSet, **always one replica** | All state is in one file on a persistent volume: the API mappings, the subscription tokens and the pending event queue. The service has no leader election or locking, so only one pod may ever run. Unlike a Deployment, a StatefulSet never runs two pods for the same identity, not during a rollout and not when a node is lost. |
-| PersistentVolumeClaim (`data-<fullname>-0`) | `ReadWriteOncePod` by default, so only one pod can mount it. Kept (`Retain`) when the release is uninstalled, because losing it loses queued events: the API Portal never redelivers a webhook. |
-| ConfigMap | `config.toml`: the gateway URL, the log level and `[api_handles]`. A change rolls the pod, because the service reads its config only at startup. |
+| Deployment, **two replicas** by default | The service keeps no state: every lookup reads the gateway, and each webhook is applied before the portal is answered, so any replica can take any delivery. A rolling update brings the new pod up before taking an old one down (`maxSurge: 1`, `maxUnavailable: 0`). |
+| ConfigMap | `config.toml`: the gateway URL, the log level and `[api_handles]`. A change rolls the pods, because the service reads its config only at startup. |
 | Secret (optional) | Only with `secret.create=true`. In production, point `secret.existingSecret` at a Secret managed outside Helm. |
-| Service + headless Service | ClusterIP only, on port 8085. The headless one is the StatefulSet's governing Service. |
-| PodDisruptionBudget (optional) | Blocks voluntary evictions of the single pod; see [Operating it](#operating-it). |
+| Service | ClusterIP only, on port 8085. |
+| PodDisruptionBudget | On by default with `maxUnavailable: 1`, so a node drain evicts one replica at a time; see [Operating it](#operating-it). |
 | NetworkPolicy (optional) | Limits inbound traffic to the API Portal, and outbound traffic to DNS and the gateway. |
 | ServiceAccount | No API token is mounted; the service never calls the Kubernetes API. |
 | `helm test` pod | Calls `/health` through the Service. |
@@ -22,8 +21,8 @@ The pod runs as UID/GID 10001 with a read-only root filesystem, no
 capabilities, no privilege escalation and the `RuntimeDefault` seccomp profile.
 It satisfies the Kubernetes **restricted** Pod Security Standard.
 
-**The endpoints are unauthenticated.** `/status`, `/failed` and
-`POST /failed/requeue` must stay inside the cluster. That is why the chart
+**The endpoints are unauthenticated.** The webhook endpoint and `/status`
+must stay inside the cluster. That is why the chart
 offers no Ingress, LoadBalancer or NodePort: the API Portal runs in the same
 cluster and calls the ClusterIP Service directly. In a shared cluster, also
 enable the NetworkPolicy, so that only the portal can reach the mediator.
@@ -90,8 +89,8 @@ credential values.
 ### 4. Verify and connect the portal
 
 ```bash
-kubectl -n subscription-mediator rollout status statefulset/subscription-mediator
-kubectl -n subscription-mediator logs statefulset/subscription-mediator
+kubectl -n subscription-mediator rollout status deployment/subscription-mediator
+kubectl -n subscription-mediator logs deployment/subscription-mediator
 helm test subscription-mediator -n subscription-mediator
 ```
 
@@ -106,61 +105,43 @@ http://subscription-mediator.subscription-mediator.svc:8085/devportal/events
 
 ## Operating it
 
-- **Reading the operational endpoints:**
+- **Reading the operational endpoint:**
   ```bash
   kubectl -n subscription-mediator port-forward svc/subscription-mediator 8085:8085
   curl -s localhost:8085/status
-  curl -s localhost:8085/failed
-  curl -s -X POST localhost:8085/failed/requeue
   ```
+  `/status` reports `{"events":{"applied":N,"failed":N}}`. The counters are
+  in memory and per pod, so they reset on restart and a port-forward shows
+  one replica only.
+- **Finding failed events:** each webhook is applied before the portal gets
+  its answer: `200` once the gateway reflects the event, `422` when the event
+  cannot be applied (the response and the pod log say why), `502` when the
+  gateway failed or could not be reached. The API Portal attempts each
+  delivery exactly once and never retries, so a failure shows up as a
+  `FAILED` delivery in the portal's webhook delivery history. Fix the cause,
+  then repeat the action in the portal so it sends a new event. For a missed
+  `subscription.created`, regenerate the subscription token: that event
+  carries everything the mediator needs to create the subscription.
 - **Mapping a portal API to a gateway handle:** add it under
-  `config.apiHandles` and run `helm upgrade`. The pod restarts with the new
-  config. Then requeue the failed events.
+  `config.apiHandles` and run `helm upgrade`. The pods restart with the new
+  config. Then repeat the failed actions in the portal.
 - **Rotating credentials:** update the Secret, then run
-  `kubectl rollout restart statefulset/<fullname>`. Environment variables are
+  `kubectl rollout restart deployment/<fullname>`. Environment variables are
   read only at startup. With `secret.create=true`, `helm upgrade` restarts the
-  pod for you.
-- **Every restart is a gap in which webhooks are lost.** The API Portal
-  attempts each delivery exactly once and never retries. While the single pod
-  is down, deliveries are marked `FAILED` in the portal and never resent.
-  Events the mediator had already accepted are safe: each one is on the
-  volume before the portal gets its `202`. The gap includes:
-  - the old pod stopping, which stops accepting at once on SIGTERM;
-  - the volume moving, if the new pod lands on another node, which can take
-    a minute or more on Azure Disk;
-  - the new pod starting.
-
-  So:
-  - Upgrade, rotate credentials and change config in a quiet window.
-  - Afterwards, check the portal's webhook delivery history for `FAILED`
-    deliveries in that window, and redo the action in the portal so it sends
-    a new event. For a missed subscription event, regenerate the subscription
-    token: the new event carries everything the mediator needs.
-- **Node maintenance is the same kind of gap.** The chart has an optional
-  `podDisruptionBudget` (`maxUnavailable: 0`). It is off by default because,
-  with one replica, it blocks every node drain and managed cluster upgrade
-  until someone deletes the pod by hand. Turn it on if you'd rather every
-  eviction were a deliberate, scheduled act. Either way, give the pod a
-  `priorityClassName` so it isn't preempted under resource pressure.
-- **Backups:** the volume holds the subscription tokens the service needs to
-  re-create subscriptions on a plan change. Include the PVC in your volume
-  snapshot or backup policy (Velero, Azure Backup for AKS).
-- **Uninstalling** keeps the PVC (`persistence.retentionPolicy.whenDeleted:
-  Retain`). Delete it explicitly once you are sure it is no longer needed:
-  `kubectl -n <ns> delete pvc data-<fullname>-0`.
+  pods for you.
+- **Restarts and node maintenance:** on SIGTERM a pod stops accepting
+  webhooks and finishes the ones it is applying (each within 25s;
+  `terminationGracePeriodSeconds` is 45). With two or more replicas, a rolling
+  restart, an upgrade or a node drain always leaves a pod to deliver to, and
+  the PodDisruptionBudget keeps a drain from evicting both at once. With
+  `replicaCount: 1`, every restart is a gap in which deliveries fail. Either
+  way, give the pods a `priorityClassName` so they aren't preempted under
+  resource pressure.
 
 ### Settings that cannot change after install
 
-A StatefulSet's volume claim template, selector and governing Service are
-immutable. If you change `persistence.size`, `storageClass`, `accessModes` or
-`annotations`, or `nameOverride` / `fullnameOverride`, `helm upgrade` fails.
-To change them:
-
-1. Delete the StatefulSet, keeping the pod and PVC:
-   `kubectl delete statefulset <fullname> --cascade=orphan`.
-2. Run the upgrade.
-3. To resize the volume itself, edit the PVC; the StorageClass must allow
-   expansion.
+A Deployment's selector is immutable. If you change `nameOverride` or
+`fullnameOverride`, `helm upgrade` fails; uninstall and install again instead.
 
 ## Values
 
@@ -176,11 +157,10 @@ values at install time. The ones most installs set:
 | `config.logging.level` | `info` | `debug`, `info`, `warn` or `error` |
 | `config.apiHandles` | `{}` | `"<name>:<version>": <gateway-handle>` pins |
 | `secret.existingSecret` | `""` | Secret holding the credentials |
-| `persistence.storageClass` | cluster default | e.g. `managed-csi` on AKS |
-| `persistence.accessModes` | `[ReadWriteOncePod]` | use `ReadWriteOnce` if the CSI driver lacks RWOP |
+| `replicaCount` | `2` | keep at 2 or more so a restart doesn't drop deliveries |
 | `networkPolicy.enabled` | `false` | enable in production, with `ingress.from` and `egress.rules` |
-| `podDisruptionBudget.enabled` | `false` | make node drains wait for a planned window |
-| `priorityClassName` | `""` | protect the pod from preemption |
+| `podDisruptionBudget.enabled` | `true` | evict at most `podDisruptionBudget.maxUnavailable` (1) replica at a time |
+| `priorityClassName` | `""` | protect the pods from preemption |
 | `resources` | 50m / 64Mi requested, 256Mi limit | |
 
 ## Checking a change to the chart

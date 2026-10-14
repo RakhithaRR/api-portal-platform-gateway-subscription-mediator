@@ -38,7 +38,8 @@ echo-api-v1  ·  reading-list-api-v1  ·  pizzashack-api-1-0-0
 
 The portal's own API UUID means nothing to a gateway fed by API Manager, so this
 is how a portal subscription finds the right gateway API. Get it wrong and the
-mediator reports `no gateway REST API matches portal API ...` on `GET /failed`.
+mediator answers the delivery with `422` and logs
+`no gateway REST API matches portal API ...`.
 
 `spec.subscriptionPlans` must likewise name a plan that exists on the gateway
 **with its throttle limits set** — see step 10 of the walkthrough for why that

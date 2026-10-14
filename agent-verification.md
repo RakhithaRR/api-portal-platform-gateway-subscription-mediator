@@ -22,6 +22,17 @@ API Portal 1.0.0
 ([docs](https://wso2.com/api-platform/docs/api-portal/1.0.0/overview/) ·
 [`api-portal/v1.0.0`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0)).
 
+> **The gateway must carry the subscription API change from
+> [wso2/api-platform#3782](https://github.com/wso2/api-platform/issues/3782)**,
+> which stock 1.2.0 does not have: `POST /subscriptions` accepting `referenceId`,
+> `GET /subscriptions?referenceId=`, and a partial `PUT /subscriptions/{id}` that
+> also takes `subscriptionPlanId` (`null` clears it) and `subscriptionToken`. The
+> mediator finds every subscription by that reference ID and changes plans and
+> tokens in place. Against a stock 1.2.0 gateway, which ignores `referenceId`,
+> Phases 6–9 do not behave as written — status and plan changes answer `422`
+> because no subscription carries the reference, and a token regeneration
+> creates a second subscription. That is a missing prerequisite, not a finding.
+
 The portal endpoints used below are specified in the API Portal
 [Management REST API reference](https://wso2.com/api-platform/docs/api-portal/1.0.0/overview/)
 (Subscriptions, API Keys, Subscription Plans, Webhook Subscribers); the gateway
@@ -37,7 +48,7 @@ Each portal action's webhook is described in the
 | Input | Notes |
 |---|---|
 | `wso2am-4.7.0` pack, unpacked | not started, default config is fine |
-| `wso2apip-api-gateway-1.2.0.zip` | [`gateway/v1.2.0`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0) |
+| `wso2apip-api-gateway-1.2.0.zip` | [`gateway/v1.2.0`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0), **built with the subscription API change** in [#3782](https://github.com/wso2/api-platform/issues/3782) — see above |
 | `wso2apip-api-portal-1.0.0.zip` | [`api-portal/v1.0.0`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0) |
 | This repository | the `resources/` and `subscription-mediator/` directories |
 | JDK 21+ | API Manager 4.7.0 passes `--enable-native-access=ALL-UNNAMED`; **JDK 11 refuses to start** with `Could not create the Java Virtual Machine` |
@@ -55,13 +66,14 @@ the ids and secrets each step emits — sourcing one env file between commands i
 the simplest way to survive a fresh shell per step.
 
 After each portal action, **wait for the mediator to apply it** before asserting
-on the gateway. Deliveries are asynchronous and typically land within 5–20
-seconds:
+on the gateway. The portal delivers asynchronously — its delivery worker polls
+every couple of seconds — and the mediator applies each event before it answers,
+so deliveries typically land within 5–20 seconds:
 
 ```bash
 wait_applied() {          # wait_applied <expected-applied-count>
   for _ in $(seq 1 20); do
-    n=$(curl -s localhost:8085/status | jq -r .queue.applied)
+    n=$(curl -s localhost:8085/status | jq -r .events.applied)
     if [ "$n" -ge "$1" ]; then
       sleep 5            # settle — see below; do not remove
       return 0
@@ -72,12 +84,16 @@ wait_applied() {          # wait_applied <expected-applied-count>
 }
 ```
 
-Polling `/status` beats a fixed `sleep`: `queue.applied` must rise by one per
-portal action, and `queue.failed` / `queue.failedFinal` must stay `0`
-throughout. If either is non-zero, `GET /failed` names the event and the reason
-— that is a finding.
+Polling `/status` beats a fixed `sleep`: `events.applied` must rise by one per
+portal action, and `events.failed` must stay `0` throughout (Phase 11 makes one
+failure on purpose). A non-zero `events.failed` is a finding: the mediator log
+line for that event gives the reason, and the portal's delivery history (end of
+Phase 11) shows it as `FAILED` with the HTTP status the mediator answered —
+`422` for an event that cannot be applied as it stands, `502` for a gateway that
+failed or could not be reached. There is no requeue; recovery is to fix the
+cause and repeat the portal action.
 
-> **Why the `sleep 5` inside the helper.** `queue.applied` rises when the
+> **Why the `sleep 5` inside the helper.** `events.applied` rises when the
 > mediator's call to the gateway **controller** succeeded. The **router** learns
 > about the change over xDS a moment later, so an invocation fired the instant
 > the counter moves can still hit the old state. Asserting with no settle
@@ -87,8 +103,9 @@ throughout. If either is non-zero, `GET /failed` names the event and the reason
 > the helper, keep it.
 
 The counters below (`wait_applied 2`, `wait_applied 4`, …) are **absolute**, and
-assume Part 1 left the mediator at `applied: 0` — which step S8 guarantees. If
-you re-run Part 2 against a mediator that already has history, read the starting
+assume Part 1 left the mediator at `applied: 0` — which step S8 guarantees. The
+counters are in memory and reset whenever the mediator restarts. If you re-run
+Part 2 against a mediator that already has history, read the starting
 value `N` from `/status` first and treat every `wait_applied K` as
 `wait_applied <N+K>`.
 
@@ -351,24 +368,21 @@ SM_GATEWAY_BASE_URL=http://host.docker.internal:9090/api/management/v1
 EOF
 
 make build
-docker compose down -v      # discard any state from an earlier run
-docker compose up -d
+docker compose up -d --force-recreate      # a fresh process starts its counters at zero
 sleep 10
-docker compose logs | grep -E "loaded state|is ready"
+docker compose logs | grep -E "reachable|is ready"
 ```
 
 **Expected:**
 
 ```
-msg="loaded state" path=/app/data/state.jsonl subscriptions=0 api_keys=0 queued_events=0 failed_events=0
-msg="subscription-mediator is ready" workers=4 max_pending_events=5000
+msg="the gateway management API is reachable and the credentials were accepted"
+msg="subscription-mediator is ready"
 ```
 
-> **`down -v` is not optional for a clean run.** `state.jsonl` lives in a named
-> volume that survives `docker compose down`. Left in place, the mediator starts
-> holding mappings to portal ids from a previous portal database — the counters
-> this document asserts on are then meaningless. `subscriptions=0 api_keys=0`
-> is the only acceptable starting line.
+The mediator keeps no state: there is no volume to clear between runs. Every
+lookup reads the gateway, so a gateway left with subscriptions or keys from an
+earlier run is what a clean run has to avoid, not the mediator.
 
 On Docker Engine for Linux use `http://172.17.0.1:9090/...` for
 `SM_GATEWAY_BASE_URL` — `host.docker.internal` is a Docker Desktop name.
@@ -400,12 +414,14 @@ curl -sk -X POST "$PORTAL/webhook-subscribers" -H "Authorization: Bearer $TOKEN"
 > **Set `timeoutMs` explicitly; the default of 5000 is too tight here.** The
 > portal attempts each delivery **once** — there is no retry and no redelivery
 > endpoint — so a single slow response loses the event permanently. The
-> mediator's first connection after several idle minutes can exceed 5 s through
-> Docker Desktop's `host.docker.internal`, which is enough to drop it. A run of
-> this document did exactly that: one `subscription.plan_changed` was recorded
-> `status: FAILED, lastError: "timeout"` and never arrived, and because the
-> mediator never received it, `failed`/`failedFinal` stayed `0` and `/failed`
-> stayed empty. See the delivery check at the end of Phase 11.
+> mediator answers only after it has applied the event to the gateway, so that
+> whole apply — an API lookup, maybe a plan lookup or create, then the
+> subscription or key call — runs inside the window. Its first connection after
+> several idle minutes can also exceed 5 s through Docker Desktop's
+> `host.docker.internal`. A run of this document lost one
+> `subscription.plan_changed` that way, recorded `status: FAILED,
+> lastError: "timeout"`, while the mediator's own counters stayed clean. See the
+> delivery check at the end of Phase 11.
 
 `targetUrl` has to be resolvable **from wherever the portal runs** — use
 `localhost:8085` if the portal is on the host, or the machine's routable address
@@ -473,13 +489,12 @@ curl -s  -o /dev/null -w "mediator      %{http_code}\n" localhost:8085/health
 Record the starting counters. Part 1 leaves them at zero:
 
 ```bash
-curl -s localhost:8085/status | jq
-# {"mappings":{"apiKeys":0,"processed":0,"subscriptions":0},
-#  "queue":{"applied":0,"failed":0,"failedFinal":0,"ready":0}}
+curl -s localhost:8085/status | jq -c
+# {"events":{"applied":0,"failed":0}}
 ```
 
-**Expected:** `applied: 0`. Anything else means S8's `down -v` didn't happen, and
-every counter below is off by that amount.
+**Expected:** `applied: 0`. Anything else means the mediator was not restarted
+in S8, and every counter below is off by that amount.
 
 ---
 
@@ -737,12 +752,12 @@ printf "new token : "; curl -sk -o /dev/null -w "%{http_code}\n" "$GW_URL/readin
 ```
 
 **Expected:** old token rejected, new one accepted, **API key unchanged**. The
-gateway stores only the token's hash and cannot rewrite one in place, so the
-mediator deletes and recreates the subscription — the gateway subscription id
-changes, which is normal:
+mediator replaces the token on the existing gateway subscription — found by its
+`referenceId`, the portal's subscription id — so the gateway subscription id
+does not change:
 
 ```
-msg="recreated the gateway subscription" reason="token regeneration" gateway_subscription_id=<new>
+msg="replaced the gateway subscription's token" event_type=subscription.token_regenerated gateway_subscription_id=<same as before>
 ```
 
 ---
@@ -782,12 +797,16 @@ curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/subscriptions" \
   | jq -r '.subscriptions[] | "\(.id) \(.subscriptionPlanId // "(none)")"'
 ```
 
-**Expected:** the portal reports `Iron`, but the gateway subscription is
-recreated **with no plan**, and the mediator warns:
+**Expected:** the portal reports `Iron`, but the gateway subscription is left
+**with no plan** — the same subscription, its plan cleared in place
+(`subscriptionPlanId: null`) — and the mediator warns:
 
 ```
-msg="the new plan is not enabled for this gateway API; recreating without a plan" plan_name=Iron
+msg="the new plan is not enabled for this gateway API; clearing the subscription's plan" plan_name=Iron
 ```
+
+The `plan_changed` event carries no subscription token, and none is needed: the
+plan changes on the existing subscription, which keeps its token.
 
 This is deliberate: the mediator prefers a working subscription over a failed
 event. The consequence is **no rate limiting** — 12 rapid calls all return `200`.
@@ -835,7 +854,7 @@ curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/subscriptions" \
 > ```
 >
 > A `(none)` here, with
-> `msg="the new plan is not enabled for this gateway API; recreating without a plan"`,
+> `msg="the new plan is not enabled for this gateway API; clearing the subscription's plan"`,
 > means the `PUT` above did not land — check
 > `GET $GW_MGMT/rest-apis/reading-list-api-v1 | jq .spec.subscriptionPlans`
 > actually reads `["gold","iron"]`.
@@ -1096,10 +1115,10 @@ msg="Starting API key sync at gateway startup"
 msg="Revoking API key" api_key=<name>
 ```
 
-**Subscriptions survive; only keys are lost.** The mediator has nothing to retry
-— those events succeeded and the revocation happened afterwards — so `/failed`
-stays empty and `/failed/requeue` is a no-op. Recover by generating a fresh key
-in the portal, which works immediately:
+**Subscriptions survive; only keys are lost.** The mediator has nothing to redo
+— those events succeeded and the revocation happened afterwards — so its
+`events.failed` stays `0` and the portal shows those deliveries as `DELIVERED`.
+Recover by generating a fresh key in the portal, which works immediately:
 
 ```bash
 curl -sk -X POST "$PORTAL/apis/echo-api-v1/api-keys/generate" \
@@ -1111,36 +1130,82 @@ curl -sk -o /dev/null -w "echo with fresh key : %{http_code}\n" "$GW_URL/echo/fo
 # echo with fresh key : 200
 ```
 
-### The mediator's queue must stay clean
+### A gateway that is down fails the delivery, and the portal records it
+
+The mediator keeps no queue and does not retry: it applies each event before it
+answers, and a gateway it cannot reach fails the delivery with `502`. This
+checks that, and the recovery. It runs **after** the restart check above,
+because starting the controller again revokes portal-issued keys once more.
+
+```bash
+cd "$GW_DIR" && docker compose stop gateway-controller
+
+curl -sk -X POST "$PORTAL/apis/echo-api-v1/api-keys/generate" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"id":"while_down"}' | jq -r .key        # record as $DOWN_KEY
+sleep 15
+curl -s localhost:8085/status | jq -c .events
+# {"applied":17,"failed":1}
+cd "$DEMO/subscription-mediator" && docker compose logs | grep "event apply failed at the gateway" | tail -1
+```
+
+**Expected:** `failed` rises to `1` and `applied` stays `17`; the mediator log
+reads `msg="event apply failed at the gateway" event_type=apikey.generated`.
+
+Bring the controller back, then recover the way an operator would — a portal
+action that sends the key again. Regenerating it does: when the gateway has no
+key for that portal key, the mediator creates it.
+
+```bash
+cd "$GW_DIR" && docker compose start gateway-controller
+for i in $(seq 1 30); do
+  c=$(curl -s -o /dev/null -w "%{http_code}" -u "$GW_USER:$GW_PASS" "$GW_MGMT/rest-apis")
+  [ "$c" = "200" ] && break; sleep 2
+done
+sleep 6
+
+curl -sk -X POST "$PORTAL/apis/echo-api-v1/api-keys/regenerate" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"keyId":"while_down"}' | jq -r .key     # record as $DOWN_KEY2
+wait_applied 18
+curl -sk -o /dev/null -w "recovered key : %{http_code}\n" "$GW_URL/echo/foo" \
+  -H "API-Key: $DOWN_KEY2" -H "Subscription-Key: $ECHO_SUB"
+# recovered key : 200
+```
+
+**Expected:** `200`. The failed generate shows in the portal's delivery history
+below.
+
+### The mediator's counters must match
 
 At the end of the run:
 
 ```bash
-curl -s localhost:8085/status | jq '.queue'
-curl -s localhost:8085/failed | jq '.count'
-# {"applied":17,"failed":0,"failedFinal":0,"ready":0}
-# 0
+curl -s localhost:8085/status | jq -c .events
+# {"applied":18,"failed":1}
 ```
 
-**Expected:** `failed` and `failedFinal` both `0`, `/failed` empty. Any entry
-there carries the reason and the exact `[api_handles]` line to add if it was a
-resolution failure.
+**Expected:** `failed: 1` — only the deliberate one above. Any other failure has
+a mediator log line with the reason, and the exact `[api_handles]` line to add
+if it was a resolution failure.
 
-### The portal's delivery log must be clean too
+### The portal's delivery log must match too
 
-A clean mediator queue is **not** sufficient. The mediator's counters only cover
-events it received; an event the portal failed to deliver leaves no trace in
+Clean mediator counters are **not** sufficient. They only cover events the
+mediator received; an event the portal failed to deliver leaves no trace in
 them at all. Ask the portal:
 
 ```bash
 curl -sk "$PORTAL/webhook-subscribers/subscription-mediator/deliveries" \
   -H "Authorization: Bearer $TOKEN" \
   | jq -r '[.list[] | select(.status != "DELIVERED")]
-           | "not delivered: \(length)", (.[] | "  \(.occurredAt) \(.eventType) \(.status) \(.lastError)")'
-# not delivered: 0
+           | "not delivered: \(length)", (.[] | "  \(.occurredAt) \(.eventType) \(.status) \(.lastHttpStatus) \(.lastError)")'
+# not delivered: 1
+#   <time> apikey.generated FAILED 502 null
 ```
 
-**Expected:** `not delivered: 0`. A `FAILED` row is a **lost portal action** —
+**Expected:** `not delivered: 1`, the deliberate `apikey.generated` with HTTP
+`502`. Any other `FAILED` row is a **lost portal action** —
 the gateway is out of sync with the portal and nothing will reconcile it on its
 own. The portal delivers each event once, with no retry and no redelivery
 endpoint (`/redeliver` and `/retry` both answer `404`), so recovery is to redo
@@ -1160,7 +1225,8 @@ happened. Call out specifically:
 
 - any `200` in the Phase 3 cross-API matrix (critical),
 - any credential that outlives its revocation, regeneration or deletion,
-- any non-zero `failed` / `failedFinal`,
+- any `events.failed` beyond the deliberate one in Phase 11, and any portal
+  delivery not `DELIVERED` beyond that one,
 - any `503` **other than** the expected one in Phase 10 — that is the gateway
   reaching an unreachable or untrusted backend, not an auth problem, and the
   router log gives the reason.
@@ -1171,15 +1237,15 @@ the assertion once, a few seconds later. A real failure repeats.
 ## Teardown
 
 ```bash
-cd "$DEMO/subscription-mediator" && docker compose down        # add -v to drop state
+cd "$DEMO/subscription-mediator" && docker compose down
 cd "$GW_DIR"     && docker compose down
 cd "$PORTAL_DIR" && docker compose down
 cd "$APIM_PACK"  && ./bin/api-manager.sh --stop                # or kill the process
 ```
 
 `docker compose down` without `-v` keeps the named volumes, so the gateway and
-portal databases survive a restart. A **re-run of Part 2 needs the mediator's
-volume dropped** (`down -v`, as in S8), or the counters will not start at zero.
+portal databases survive a restart. The mediator has no volume; restarting it
+(as in S8) resets its counters to zero for a re-run of Part 2.
 
 To reset only the verification artefacts and keep the stack up:
 
@@ -1188,6 +1254,8 @@ curl -sk -X POST "$PORTAL/apis/reading-list-api-v1/api-keys/revoke" -H "Authoriz
   -H 'Content-Type: application/json' -d '{"keyId":"verify_rl"}'
 curl -sk -X POST "$PORTAL/apis/echo-api-v1/api-keys/revoke" -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"keyId":"verify_echo"}'
+curl -sk -X POST "$PORTAL/apis/echo-api-v1/api-keys/revoke" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"keyId":"while_down"}'
 curl -sk -X DELETE "$PORTAL/subscriptions/$ECHO_SUB_ID" -H "Authorization: Bearer $TOKEN"
 curl -sk -X DELETE "$PORTAL/subscriptions/$PZ_SUB_ID"   -H "Authorization: Bearer $TOKEN"
 ```

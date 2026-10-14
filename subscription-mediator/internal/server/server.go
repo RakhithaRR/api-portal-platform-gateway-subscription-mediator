@@ -1,5 +1,5 @@
 // Package server exposes the mediator's HTTP surface: the API Portal webhook
-// receiver, a liveness probe, and a few plain diagnostic endpoints.
+// receiver, a liveness probe, and a plain status endpoint.
 //
 // This is a demo service. The endpoints are unauthenticated and plaintext —
 // don't expose the port beyond where the portal and an operator can reach it.
@@ -8,7 +8,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,29 +15,29 @@ import (
 
 	"subscription-mediator/internal/config"
 	"subscription-mediator/internal/mediator"
-	"subscription-mediator/internal/store"
 	"subscription-mediator/internal/webhook"
 )
+
+// ApplyTimeout bounds how long one delivery may spend on gateway calls. It
+// stays inside the server's write timeout so the answer still reaches the portal.
+const ApplyTimeout = 25 * time.Second
 
 // Server owns the HTTP listener.
 type Server struct {
 	codec    *webhook.Codec
 	mediator *mediator.Mediator
-	store    *store.Store
 	logger   *slog.Logger
 	http     *http.Server
 }
 
 // New builds the HTTP server.
-func New(codec *webhook.Codec, med *mediator.Mediator, st *store.Store, logger *slog.Logger) *Server {
-	s := &Server{codec: codec, mediator: med, store: st, logger: logger}
+func New(codec *webhook.Codec, med *mediator.Mediator, logger *slog.Logger) *Server {
+	s := &Server{codec: codec, mediator: med, logger: logger}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+config.WebhookPath, s.handleWebhook)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /status", s.handleStatus)
-	mux.HandleFunc("GET /failed", s.handleFailed)
-	mux.HandleFunc("POST /failed/requeue", s.handleRequeue)
 
 	s.http = &http.Server{
 		Addr:    config.ListenAddress,
@@ -63,12 +62,14 @@ func (s *Server) ListenAndServe() error {
 // Shutdown stops accepting new requests and waits out the in-flight ones.
 func (s *Server) Shutdown(ctx context.Context) error { return s.http.Shutdown(ctx) }
 
-// handleWebhook receives one API Portal delivery.
-//
-// The delivery is verified, decoded, and durably queued before it is
-// acknowledged. The portal attempts each delivery exactly once and never
-// redelivers, so acknowledging before the event is on disk would lose it on a
-// restart.
+// Handler returns the HTTP handler, so tests can drive it without a listener.
+func (s *Server) Handler() http.Handler { return s.http.Handler }
+
+// handleWebhook receives one API Portal delivery and applies it before
+// answering, as the Platform API does: 200 once the gateway reflects the event,
+// an error otherwise. The portal never redelivers, so a non-2xx answer leaves
+// the delivery FAILED in its own delivery history, which is where an operator
+// finds it.
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, config.MaxBodyBytes))
 	if err != nil {
@@ -98,30 +99,26 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		slog.String("event_type", env.EventType),
 	)
 
-	queued, err := s.mediator.Accept(env, body)
-	if err != nil {
-		if errors.Is(err, store.ErrQueueFull) {
-			// The bounded queue is full. Rejecting is the honest answer: the
-			// portal marks the delivery failed, which is visible in its own
-			// webhook-event listing, rather than the queue growing without limit.
-			log.Error("rejected a delivery because the pending queue is full")
-			w.Header().Set("Retry-After", "30")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "the event queue is full"})
+	// Detached from the request: a portal that gives up waiting must not cut an
+	// update off halfway. The gateway calls are idempotent, so finishing after
+	// the portal has marked the delivery FAILED is harmless.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), ApplyTimeout)
+	defer cancel()
+
+	if err := s.mediator.Handle(ctx, env, body); err != nil {
+		if mediator.IsPermanent(err) {
+			// Retrying the same event cannot succeed; the message says what to fix.
+			log.Error("event cannot be applied", slog.Any("error", err))
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error(), "eventId": env.EventID})
 			return
 		}
-		log.Error("failed to queue a webhook delivery", slog.Any("error", err))
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "the event could not be accepted"})
+		log.Error("event apply failed at the gateway", slog.Any("error", err))
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error(), "eventId": env.EventID})
 		return
 	}
 
-	if !queued {
-		log.Info("duplicate of an already-applied event; acknowledging")
-		writeJSON(w, http.StatusOK, map[string]string{"status": "duplicate", "eventId": env.EventID})
-		return
-	}
-
-	log.Info("queued webhook delivery")
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted", "eventId": env.EventID})
+	log.Info("applied webhook event")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "processed", "eventId": env.EventID})
 }
 
 // handleHealth is the liveness probe, and backs the container healthcheck.
@@ -129,60 +126,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleStatus reports queue depth and mapping counts.
+// handleStatus reports how many events this process has applied and failed
+// since it started.
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	ready, failed := s.store.PendingStats()
-	applied, permanentFailures := s.mediator.Stats()
+	applied, failed := s.mediator.Stats()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"queue": map[string]any{
-			"ready":       ready,
-			"failed":      failed,
-			"applied":     applied,
-			"failedFinal": permanentFailures,
-		},
-		"mappings": map[string]int{
-			"subscriptions": s.store.SubscriptionCount(),
-			"apiKeys":       s.store.APIKeyCount(),
-			"processed":     s.store.ProcessedCount(),
+		"events": map[string]int64{
+			"applied": applied,
+			"failed":  failed,
 		},
 	})
-}
-
-// handleFailed lists events that exhausted every attempt, so it is obvious what
-// needs attention and why.
-func (s *Server) handleFailed(w http.ResponseWriter, _ *http.Request) {
-	type view struct {
-		Seq        uint64    `json:"seq"`
-		EventID    string    `json:"eventId"`
-		EventType  string    `json:"eventType"`
-		Attempts   int       `json:"attempts"`
-		ReceivedAt time.Time `json:"receivedAt"`
-		LastError  string    `json:"lastError"`
-	}
-	records := s.store.FailedPending(200)
-	out := make([]view, 0, len(records))
-	for _, record := range records {
-		out = append(out, view{
-			Seq: record.Seq, EventID: record.EventID, EventType: record.EventType,
-			Attempts: record.Attempts, ReceivedAt: record.ReceivedAt, LastError: record.LastError,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"count": len(out), "failed": out})
-}
-
-// handleRequeue returns every failed event to the queue, for after whatever
-// blocked them has been fixed.
-func (s *Server) handleRequeue(w http.ResponseWriter, _ *http.Request) {
-	requeued, err := s.store.RequeueFailed()
-	if err != nil {
-		s.logger.Error("failed to requeue failed events", slog.Any("error", err))
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "the events could not be requeued"})
-		return
-	}
-	// Records that just became due carry no new arrival to wake the dispatcher.
-	s.mediator.Nudge()
-	s.logger.Info("requeued failed events", slog.Int("count", requeued))
-	writeJSON(w, http.StatusOK, map[string]any{"requeued": requeued})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

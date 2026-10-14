@@ -1,9 +1,8 @@
 # Default values for subscription-mediator.
 #
-# The mediator keeps all of its state - API mappings, subscription tokens and
-# the pending event queue - in one file on a persistent volume. It has no
-# leader election, so the chart always runs exactly ONE replica as a
-# StatefulSet. There is deliberately no replicaCount or autoscaling value.
+# The mediator keeps no state: every lookup reads the gateway, and each
+# webhook is applied before the portal is answered. It runs as a Deployment,
+# and any replica can take any delivery.
 
 nameOverride: ""
 fullnameOverride: ""
@@ -38,8 +37,8 @@ config:
     level: info
   # Pins a portal API to a gateway API handle when name + version matching
   # cannot tell which API is meant. Keys are "<name>:<version>" or the
-  # portal's api ref_id, matched case-insensitively. GET /failed names the
-  # exact key to add.
+  # portal's api ref_id, matched case-insensitively. The failed event's log
+  # line names the exact key to add.
   apiHandles: {}
   #  "order api:v1.0": orderapi-1.0.0
 
@@ -64,28 +63,12 @@ secret:
   gatewayUsername: ""
   gatewayPassword: ""
 
-# --- Storage ----------------------------------------------------------------
-persistence:
-  # Without persistence the queue and mappings are lost on every restart, and
-  # the API Portal never redelivers. Disable only for throwaway environments.
-  enabled: true
-  # Leave empty for the cluster's default StorageClass.
-  storageClass: ""
-  # ReadWriteOncePod guarantees only one pod can ever mount the volume. Use
-  # ReadWriteOnce if your CSI driver does not support it.
-  accessModes:
-    - ReadWriteOncePod
-  size: 1Gi
-  annotations: {}
-  # Mount an existing PVC instead of the StatefulSet's volume claim template.
-  existingClaim: ""
-  # What happens to the PVC when the StatefulSet is deleted or scaled down.
-  # Retain keeps queued events safe across an uninstall/reinstall.
-  retentionPolicy:
-    whenDeleted: Retain
-    whenScaled: Retain
-
 # --- Workload ---------------------------------------------------------------
+# Two replicas keep a delivery target up through a restart, a rollout or a
+# node drain. The API Portal never redelivers, so a delivery that finds no pod
+# is lost until someone repeats the action in the portal.
+replicaCount: 2
+
 serviceAccount:
   create: true
   # Defaults to the release's full name.
@@ -95,19 +78,14 @@ serviceAccount:
 podAnnotations: {}
 podLabels: {}
 
-# The mediator drains in-flight requests (up to 20s) and then its workers (up
-# to 20s more) on SIGTERM; this leaves headroom for both. It stops accepting
-# webhooks as soon as SIGTERM arrives, so a longer value does not lengthen the
-# gap in which deliveries fail.
-terminationGracePeriodSeconds: 60
+# On SIGTERM the mediator stops accepting webhooks and lets the deliveries it
+# is applying finish, each within 25s; this leaves headroom for that.
+terminationGracePeriodSeconds: 45
 
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 10001
   runAsGroup: 10001
-  # Makes the state volume writable by the service user.
-  fsGroup: 10001
-  fsGroupChangePolicy: OnRootMismatch
   seccompProfile:
     type: RuntimeDefault
 
@@ -124,7 +102,6 @@ resources:
     cpu: 50m
     memory: 64Mi
   limits:
-    # The pending queue is capped at 5000 events, so memory stays small.
     memory: 256Mi
 
 # On startup the mediator probes the gateway for up to 15s before it starts
@@ -156,12 +133,12 @@ extraEnv: []
 #  - name: SM_LOG_LEVEL
 #    value: debug
 
-# Off by default. With a single replica, a budget blocks node drains and
-# cluster upgrades until the pod is deleted by hand. Turn it on to make every
-# eviction a deliberate, scheduled act, because webhooks that arrive while the
-# pod is down are lost (the API Portal does not retry).
+# Lets a node drain or cluster upgrade evict one replica at a time, so a
+# delivery target stays up. Needs replicaCount of 2 or more: with one replica,
+# maxUnavailable 1 allows the only pod to be evicted.
 podDisruptionBudget:
-  enabled: false
+  enabled: true
+  maxUnavailable: 1
 
 nodeSelector: {}
 tolerations: []
@@ -171,8 +148,8 @@ priorityClassName: ""
 
 # --- Networking -------------------------------------------------------------
 # ClusterIP only: the API Portal runs in the same cluster, and every endpoint
-# of the mediator is unauthenticated, including /status, /failed and
-# POST /failed/requeue. Register this as the portal's webhook targetUrl:
+# of the mediator is unauthenticated. Register this as the portal's webhook
+# targetUrl:
 #   http://<fullname>.<namespace>.svc:<service.port>/devportal/events
 service:
   port: 8085

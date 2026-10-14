@@ -5,8 +5,8 @@
 
 {{/*
 Fully qualified name. Truncated to 52 characters, leaving room for the
-"-headless" suffix and the StatefulSet's controller-revision hash label inside
-Kubernetes' 63-character limit.
+suffixes Kubernetes appends to a Deployment's ReplicaSet and pod names inside
+its 63-character limit.
 */}}
 {{- define "subscription-mediator.fullname" -}}
 {{- if .Values.fullnameOverride }}

@@ -1,29 +1,25 @@
 {{- $fullname := include "subscription-mediator.fullname" . }}
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: {{ $fullname }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "subscription-mediator.labels" . | nindent 4 }}
 spec:
-  # Always exactly one: the state file has a single writer and no locking. A
-  # StatefulSet, unlike a Deployment, never runs two pods for the same identity
-  # at once - not during a rollout, and not when a node is lost.
-  replicas: 1
-  serviceName: {{ $fullname }}-headless
+  # The mediator keeps no state, so any replica can take any delivery.
+  replicas: {{ .Values.replicaCount }}
   revisionHistoryLimit: 10
-  podManagementPolicy: OrderedReady
-  updateStrategy:
+  strategy:
     type: RollingUpdate
+    rollingUpdate:
+      # Bring the new pod up before taking an old one down, so a rollout
+      # never leaves the portal with nothing to deliver to.
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       {{- include "subscription-mediator.selectorLabels" . | nindent 6 }}
-  {{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
-  persistentVolumeClaimRetentionPolicy:
-    whenDeleted: {{ .Values.persistence.retentionPolicy.whenDeleted }}
-    whenScaled: {{ .Values.persistence.retentionPolicy.whenScaled }}
-  {{- end }}
   template:
     metadata:
       labels:
@@ -105,21 +101,10 @@ spec:
             - name: config
               mountPath: /etc/subscription-mediator
               readOnly: true
-            # Mappings, tokens and the pending queue; the only path written.
-            - name: data
-              mountPath: /app/data
       volumes:
         - name: config
           configMap:
             name: {{ $fullname }}
-        {{- if not .Values.persistence.enabled }}
-        - name: data
-          emptyDir: {}
-        {{- else if .Values.persistence.existingClaim }}
-        - name: data
-          persistentVolumeClaim:
-            claimName: {{ .Values.persistence.existingClaim }}
-        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -136,23 +121,3 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-  {{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-        labels:
-          {{- include "subscription-mediator.selectorLabels" . | nindent 10 }}
-        {{- with .Values.persistence.annotations }}
-        annotations:
-          {{- toYaml . | nindent 10 }}
-        {{- end }}
-      spec:
-        accessModes:
-          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
-        {{- with .Values.persistence.storageClass }}
-        storageClassName: {{ . | quote }}
-        {{- end }}
-        resources:
-          requests:
-            storage: {{ .Values.persistence.size }}
-  {{- end }}

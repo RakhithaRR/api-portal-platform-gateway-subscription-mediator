@@ -6,6 +6,17 @@
 // subscription plans, subscriptions, and API keys. The request and response
 // shapes are those of gateway 1.2.0 and are not guaranteed against any other
 // release.
+//
+// The subscription operations also rely on three changes the 1.2.0 API does not
+// have yet (https://github.com/wso2/api-platform/issues/3782):
+//
+//   - POST /subscriptions accepts a caller-supplied referenceId;
+//   - GET /subscriptions filters on referenceId;
+//   - PUT /subscriptions/{id} is a partial update that also accepts
+//     subscriptionPlanId (null clears it) and subscriptionToken.
+//
+// The field and query names are in one place, ReferenceIDField, so they can
+// follow whatever the gateway ships.
 package gateway
 
 import (
@@ -20,6 +31,10 @@ import (
 	"strings"
 	"time"
 )
+
+// ReferenceIDField is the subscription field, and the GET /subscriptions query
+// parameter, that carries a caller-supplied reference ID.
+const ReferenceIDField = "referenceId"
 
 // Subscription statuses the gateway accepts.
 const (
@@ -92,6 +107,7 @@ type SubscriptionPlan struct {
 // Subscription is a gateway subscription.
 type Subscription struct {
 	ID                 string `json:"id"`
+	ReferenceID        string `json:"referenceId,omitempty"`
 	APIID              string `json:"apiId"`
 	ApplicationID      string `json:"applicationId,omitempty"`
 	SubscriptionPlanID string `json:"subscriptionPlanId,omitempty"`
@@ -100,11 +116,42 @@ type Subscription struct {
 
 // SubscriptionCreateRequest is the body of POST /subscriptions.
 type SubscriptionCreateRequest struct {
+	// ReferenceID is the caller's own identifier for the subscription, which
+	// every later lookup uses instead of the gateway's generated ID.
+	ReferenceID        string `json:"referenceId,omitempty"`
 	APIID              string `json:"apiId"`
 	SubscriptionToken  string `json:"subscriptionToken"`
 	ApplicationID      string `json:"applicationId,omitempty"`
 	SubscriptionPlanID string `json:"subscriptionPlanId,omitempty"`
 	Status             string `json:"status,omitempty"`
+}
+
+// SubscriptionUpdate is a partial update for PUT /subscriptions/{id}: a nil
+// field is left out of the body and stays as it is on the gateway.
+type SubscriptionUpdate struct {
+	Status            *string
+	SubscriptionToken *string
+	// SubscriptionPlanID set to "" clears the plan, sent as an explicit null.
+	SubscriptionPlanID *string
+}
+
+// MarshalJSON sends only the fields that are set.
+func (u SubscriptionUpdate) MarshalJSON() ([]byte, error) {
+	body := map[string]any{}
+	if u.Status != nil {
+		body["status"] = *u.Status
+	}
+	if u.SubscriptionToken != nil {
+		body["subscriptionToken"] = *u.SubscriptionToken
+	}
+	if u.SubscriptionPlanID != nil {
+		if *u.SubscriptionPlanID == "" {
+			body["subscriptionPlanId"] = nil
+		} else {
+			body["subscriptionPlanId"] = *u.SubscriptionPlanID
+		}
+	}
+	return json.Marshal(body)
 }
 
 // APIKeyRequest is the body of the API key create and update operations.
@@ -116,11 +163,15 @@ type APIKeyRequest struct {
 	ExternalRefID string     `json:"externalRefId,omitempty"`
 }
 
+// API key statuses the gateway reports.
+const KeyStatusRevoked = "revoked"
+
 // APIKey is a gateway API key.
 type APIKey struct {
-	Name   string `json:"name"`
-	APIID  string `json:"apiId"`
-	Status string `json:"status"`
+	Name          string `json:"name"`
+	APIID         string `json:"apiId"`
+	Status        string `json:"status"`
+	ExternalRefID string `json:"externalRefId,omitempty"`
 }
 
 // Client talks to the management API over HTTP basic auth.
@@ -227,13 +278,6 @@ func (c *Client) ListSubscriptionPlans(ctx context.Context) ([]SubscriptionPlan,
 	return resp.SubscriptionPlans, nil
 }
 
-// GetSubscriptionPlan fetches one plan by gateway id.
-func (c *Client) GetSubscriptionPlan(ctx context.Context, planID string) (*SubscriptionPlan, error) {
-	var plan SubscriptionPlan
-	err := c.do(ctx, http.MethodGet, "/subscription-plans/"+url.PathEscape(planID), nil, nil, &plan)
-	return &plan, err
-}
-
 // CreateSubscriptionPlan creates a plan.
 func (c *Client) CreateSubscriptionPlan(ctx context.Context, planName string) (*SubscriptionPlan, error) {
 	body := map[string]string{"planName": planName, "status": "ACTIVE"}
@@ -249,34 +293,55 @@ func (c *Client) CreateSubscription(ctx context.Context, req *SubscriptionCreate
 	return &sub, err
 }
 
-// ListSubscriptions lists subscriptions, optionally filtered.
-func (c *Client) ListSubscriptions(ctx context.Context, apiID, applicationID string) ([]Subscription, error) {
+// FindSubscription returns the subscription carrying a reference ID, or nil
+// when the gateway has none.
+func (c *Client) FindSubscription(ctx context.Context, referenceID string) (*Subscription, error) {
 	query := url.Values{}
-	if apiID != "" {
-		query.Set("apiId", apiID)
-	}
-	if applicationID != "" {
-		query.Set("applicationId", applicationID)
-	}
+	query.Set(ReferenceIDField, referenceID)
 	var resp struct {
 		Subscriptions []Subscription `json:"subscriptions"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/subscriptions", query, nil, &resp); err != nil {
 		return nil, err
 	}
-	return resp.Subscriptions, nil
+	// Matched again here so a gateway that ignored the filter returns nothing
+	// rather than somebody else's subscription.
+	var found []Subscription
+	for _, sub := range resp.Subscriptions {
+		if sub.ReferenceID == referenceID {
+			found = append(found, sub)
+		}
+	}
+	switch len(found) {
+	case 0:
+		return nil, nil
+	case 1:
+		return &found[0], nil
+	default:
+		return nil, fmt.Errorf("the gateway holds %d subscriptions with %s %q", len(found), ReferenceIDField, referenceID)
+	}
 }
 
-// UpdateSubscriptionStatus changes a subscription's status. The gateway's update
-// operation accepts nothing else — no plan change, no new token.
-func (c *Client) UpdateSubscriptionStatus(ctx context.Context, subscriptionID, status string) error {
-	body := map[string]string{"status": status}
-	return c.do(ctx, http.MethodPut, "/subscriptions/"+url.PathEscape(subscriptionID), nil, body, nil)
+// UpdateSubscription applies a partial update.
+func (c *Client) UpdateSubscription(ctx context.Context, subscriptionID string, update SubscriptionUpdate) error {
+	return c.do(ctx, http.MethodPut, "/subscriptions/"+url.PathEscape(subscriptionID), nil, update, nil)
 }
 
 // DeleteSubscription deletes a subscription.
 func (c *Client) DeleteSubscription(ctx context.Context, subscriptionID string) error {
 	return c.do(ctx, http.MethodDelete, "/subscriptions/"+url.PathEscape(subscriptionID), nil, nil, nil)
+}
+
+// ListAPIKeys lists every key on a REST API, revoked ones included.
+func (c *Client) ListAPIKeys(ctx context.Context, apiHandle string) ([]APIKey, error) {
+	var resp struct {
+		APIKeys []APIKey `json:"apiKeys"`
+	}
+	path := "/rest-apis/" + url.PathEscape(apiHandle) + "/api-keys"
+	if err := c.do(ctx, http.MethodGet, path, nil, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.APIKeys, nil
 }
 
 // CreateAPIKey creates an API key for a REST API, injecting the portal's value.
