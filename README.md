@@ -255,8 +255,48 @@ Reference:
 [Control Plane Connection](https://wso2.com/api-platform/docs/api-gateway/1.2.0/deployment/production-deployment/control-plane-connection/)
 and the distribution's own `README.md` ("Connecting to WSO2 API Platform").
 
-Append them to `api-platform.env` (created by `./scripts/setup.sh`), then
-`docker compose up -d`. A connected gateway logs:
+Append them to `api-platform.env` (created by `./scripts/setup.sh`).
+
+### Turn on the management API's TLS listener
+
+The mediator calls the management API over TLS, on a second listener (`9093`)
+that serves the same API as the plaintext one on `9090`. It is off by default
+and has no certificate, so give it one. A self-signed certificate is enough
+here; its names must cover every host the mediator may use to reach the
+gateway — `host.docker.internal` on Docker Desktop, `$HOST_ADDR` otherwise:
+
+```bash
+# in the gateway distribution's directory
+mkdir -p gateway-controller/listener-certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -subj "/CN=gateway-management" \
+  -addext "subjectAltName=DNS:host.docker.internal,DNS:localhost,IP:127.0.0.1,IP:$HOST_ADDR" \
+  -keyout gateway-controller/listener-certs/mgmt-api.key \
+  -out gateway-controller/listener-certs/mgmt-api.crt
+```
+
+`gateway-controller/listener-certs/` is mounted read-only into the controller at
+`/app/listener-certs`. Point the listener at the pair in `configs/config.toml` —
+these keys have no environment-variable form, so edit the file:
+
+```toml
+[controller.server.tls]
+enabled = true
+port = 9093
+cert_path = "/app/listener-certs/mgmt-api.crt"
+key_path = "/app/listener-certs/mgmt-api.key"
+```
+
+And check `docker-compose.yaml` publishes the port on `gateway-controller`; add
+the line under its `ports:` if it is missing:
+
+```yaml
+      - "9093:9093"
+```
+
+Then `docker compose up -d`. If the controller logs that it cannot read the key,
+check the file's permissions against the container's user. A connected gateway
+logs:
 
 ```
 msg="Control plane connection established" gateway_id=... connection_id=...
@@ -264,11 +304,18 @@ msg="Control plane connection established" gateway_id=... connection_id=...
 
 and the Admin Portal's Gateways page flips the gateway to **Active**.
 
-Confirm the management API answers:
+Confirm the management API answers, on both listeners:
 
 ```bash
 curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/rest-apis" | jq '.apis | length'
+curl -s -o /dev/null -w "%{http_code}\n" -u "$GW_USER:$GW_PASS" \
+  --cacert gateway-controller/listener-certs/mgmt-api.crt \
+  https://localhost:9093/api/management/v1/subscription-plans
+# 200
 ```
+
+The walkthrough's own calls keep using the plaintext `$GW_MGMT`; only the
+mediator uses `9093`.
 
 ## 4. Create the subscription plans on the gateway
 
@@ -441,16 +488,25 @@ same one.
 export WEBHOOK_SECRET=$(openssl rand -base64 48)
 ```
 
-Put it, and the gateway credentials, in a `.env` beside the compose file. It's
-git-ignored, so nothing secret lands in the repo:
+The mediator has to trust the gateway's management certificate. It is
+self-signed, so it is its own CA: copy it into the mediator's `certs/`, which
+compose mounts read-only at `/app/certs`:
 
 ```bash
 cd subscription-mediator
+cp <gateway-distribution>/gateway-controller/listener-certs/mgmt-api.crt certs/gateway-ca.crt
+```
+
+Put the secret, the gateway credentials and the CA's path in a `.env` beside the
+compose file. It's git-ignored, so nothing secret lands in the repo:
+
+```bash
 cat > .env <<EOF
 SM_WEBHOOK_SECRET=$WEBHOOK_SECRET
 SM_GATEWAY_USERNAME=$GW_USER
 SM_GATEWAY_PASSWORD=$GW_PASS
-SM_GATEWAY_BASE_URL=http://host.docker.internal:9090/api/management/v1
+SM_GATEWAY_BASE_URL=https://host.docker.internal:9093/api/management/v1
+SM_GATEWAY_CA_FILE=/app/certs/gateway-ca.crt
 EOF
 
 make build
@@ -466,8 +522,10 @@ msg="subscription-mediator is ready"
 msg="listening for API Portal webhooks" address=0.0.0.0:8085 path=/devportal/events
 ```
 
-On Docker Engine for Linux use `http://172.17.0.1:9090/...` instead —
-`host.docker.internal` is a Docker Desktop name. The mediator's
+`SM_GATEWAY_BASE_URL` above is also the default. On Docker Engine for Linux use
+`https://172.17.0.1:9093/...` instead — `host.docker.internal` is a Docker
+Desktop name — which the certificate covers as long as `$HOST_ADDR` was
+`172.17.0.1` when you made it. The mediator's
 [README](subscription-mediator/README.md) has the full matrix, including running
 the portal or gateway outside Docker or in Kubernetes.
 
@@ -739,10 +797,13 @@ portal records against the delivery — names the exact line to add.
 | `401 Valid API key required` with a fresh key | the event never reached the gateway — check the portal's delivery history (below) and `events.failed` in `GET /status` on the mediator |
 | A delivery `FAILED` with HTTP `502` | the mediator could not reach the gateway, or the gateway failed. Fix that, then repeat the portal action |
 | A delivery `FAILED` with HTTP `422` | the event cannot be applied as it stands; the mediator log says why and what to change |
-| `the gateway has no subscription with reference ID ...` | the subscription's `created` delivery was lost, or the gateway lacks the `referenceId` change (see [Versions](#versions)). Have the developer regenerate the subscription token, which creates it |
+| `the gateway has no subscription with reference ID ...` | the subscription's `created` delivery was lost. Have the developer regenerate the subscription token, which creates it |
 | Calls succeed but are never throttled | the gateway plan has no `throttleLimitCount`/`throttleLimitUnit` — see step 10 |
 | `no gateway REST API matches portal API ...` | name/version mismatch. Pin it under `[api_handles]`, restart the mediator, repeat the portal action |
-| Mediator container `Exited` right after start | a required setting is missing; the reason is its last log line |
+| Mediator container `Exited` right after start | a required setting is missing or invalid; the reason is its last log line. For the gateway CA: `gateway.ca_file is set but gateway.base_url ... is not https`, `failed to read the gateway CA file`, or `... holds no PEM certificate` |
+| Mediator logs `x509: certificate signed by unknown authority` | it doesn't trust the gateway's certificate — `SM_GATEWAY_CA_FILE` unset, or pointing at a different certificate than the one in `gateway-controller/listener-certs/` |
+| Mediator logs `x509: certificate is valid for ..., not ...` | the host in `SM_GATEWAY_BASE_URL` isn't among the certificate's names — regenerate it with that host in `subjectAltName`, then restart the controller |
+| Mediator logs `connection refused` on `9093` | the gateway's TLS listener is off or not published — `[controller.server.tls] enabled = true` and `"9093:9093"` under `gateway-controller` (step 3) |
 | Gateway logs `WebSocket connection failed ... dial tcp 172.17.0.1:9444: connect: connection refused` | the `extra_hosts` trap — point `APIP_GW_CONTROLLER_CONTROLPLANE_HOST` at `$HOST_ADDR`, not `host.docker.internal` |
 | A CP-created API answers without credentials | its policies aren't attached, or weren't redeployed — see step 6; **API Security / `securityScheme` does nothing** for a platform-gateway API |
 | The publisher's Policies page is empty for a platform-gateway API | it reads the remote Policy Hub — that host must be reachable from the browser |

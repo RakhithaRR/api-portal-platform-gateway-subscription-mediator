@@ -75,7 +75,8 @@ openssl rand -base64 48    # paste into [webhook] secret
 secret = "<the generated secret>"
 
 [gateway]
-base_url = "http://host.docker.internal:9090/api/management/v1"
+base_url = "https://host.docker.internal:9093/api/management/v1"
+ca_file = "/app/certs/gateway-ca.crt"
 username = "<gateway-admin-username>"
 password = "<gateway-admin-password>"
 ```
@@ -88,8 +89,16 @@ these through, and `.env` is git-ignored — so nothing secret is ever staged:
 SM_WEBHOOK_SECRET=<the generated secret>
 SM_GATEWAY_USERNAME=<gateway-admin-username>
 SM_GATEWAY_PASSWORD=<gateway-admin-password>
-SM_GATEWAY_BASE_URL=http://host.docker.internal:9090/api/management/v1
+SM_GATEWAY_BASE_URL=https://host.docker.internal:9093/api/management/v1
+SM_GATEWAY_CA_FILE=/app/certs/gateway-ca.crt
 ```
+
+The mediator calls the gateway's management API on its TLS listener, port
+`9093`. When the gateway's certificate is self-signed or from a private CA, copy
+that CA certificate (for a self-signed one, the certificate itself) to
+`certs/gateway-ca.crt` beside `docker-compose.yaml`; compose mounts `certs/` at
+`/app/certs`. Leave `ca_file` out for a certificate from a public CA. See
+[Reaching the gateway](#reaching-the-gateway-outbound).
 
 The second way is the better habit, and the one the
 [walkthrough](../README.md#7-start-the-subscription-mediator) uses.
@@ -172,8 +181,8 @@ curl -s localhost:8085/status | jq
 Then subscribe to an API in the **API Portal UI** and confirm it landed:
 
 ```bash
-curl -su "<gateway-admin-username>:<gateway-admin-password>" \
-  http://localhost:9090/api/management/v1/subscriptions | jq
+curl -su "<gateway-admin-username>:<gateway-admin-password>" --cacert certs/gateway-ca.crt \
+  https://localhost:9093/api/management/v1/subscriptions | jq
 ```
 
 Subscribing, generating and revoking keys, suspending a subscription and changing
@@ -461,7 +470,8 @@ Everything lives in `configs/config.toml`, mounted read-only at
 secret = ""                 # required
 
 [gateway]
-base_url = "..."            # required
+base_url = "..."            # defaults to https://host.docker.internal:9093/api/management/v1
+ca_file = ""                # optional: CA bundle for the gateway's TLS certificate
 username = ""               # required
 password = ""               # required
 
@@ -490,7 +500,8 @@ built-in defaults  ->  configs/config.toml  ->  SM_* environment variables
 | Setting | TOML key | Environment variable | |
 |---|---|---|---|
 | webhook secret | `[webhook] secret` | `SM_WEBHOOK_SECRET` | **required** |
-| gateway address | `[gateway] base_url` | `SM_GATEWAY_BASE_URL` | defaults to `http://host.docker.internal:9090/api/management/v1` |
+| gateway address | `[gateway] base_url` | `SM_GATEWAY_BASE_URL` | defaults to `https://host.docker.internal:9093/api/management/v1` |
+| gateway CA | `[gateway] ca_file` | `SM_GATEWAY_CA_FILE` | optional; a PEM bundle trusted in addition to the system roots |
 | gateway user | `[gateway] username` | `SM_GATEWAY_USERNAME` | **required** |
 | gateway password | `[gateway] password` | `SM_GATEWAY_PASSWORD` | **required** |
 | log level | `[logging] level` | `SM_LOG_LEVEL` | defaults to `info` |
@@ -556,22 +567,30 @@ way the other two are deployed.
   API Portal ──────▶ host:8085 ──────▶ subscription-mediator
                                                  │
                                                  ▼
-                                       host:9090 ──────▶ Gateway Controller
+                                       host:9093 ──TLS─▶ Gateway Controller
 ```
 
 ### Reaching the gateway (outbound)
 
 One setting, `[gateway] base_url`, overridable end-to-end with
 `SM_GATEWAY_BASE_URL` in a `.env` file beside `docker-compose.yaml` — no edit to
-the mounted config:
+the mounted config. Its scheme and port pick the gateway listener:
+
+| Listener | Address | `ca_file` |
+|---|---|---|
+| TLS (the default) | `https://<host>:9093/api/management/v1` | the gateway's CA, when self-signed or private |
+| plaintext | `http://<host>:9090/api/management/v1` | leave empty; setting it with an `http` address stops startup |
+
+The table below gives `<host>` for each layout, written for the TLS listener;
+for the plaintext one, swap in `http` and `9090`.
 
 | Gateway runs | `SM_GATEWAY_BASE_URL` |
 |---|---|
-| its own compose stack, Docker Desktop | *(the default)* `http://host.docker.internal:9090/api/management/v1` |
-| its own compose stack, Docker Engine on Linux | `http://172.17.0.1:9090/api/management/v1` |
+| its own compose stack, Docker Desktop | *(the default)* `https://host.docker.internal:9093/api/management/v1` |
+| its own compose stack, Docker Engine on Linux | `https://172.17.0.1:9093/api/management/v1` |
 | on the host machine | same as above — it's the same published port |
-| the mediator itself run outside Docker | `http://localhost:9090/api/management/v1` |
-| Kubernetes, or any remote host | `https://gateway.example.com/api/management/v1` |
+| the mediator itself run outside Docker | `https://localhost:9093/api/management/v1` |
+| Kubernetes, or any remote host | `https://gateway.example.com:9093/api/management/v1` |
 
 `host.docker.internal` is a Docker Desktop name. On Docker Engine for Linux it
 does not exist — use the bridge gateway address `172.17.0.1` rather than adding
@@ -584,6 +603,34 @@ that entry**, so on Rancher/Docker Desktop for macOS nothing in the gateway
 stack can reach the host by any Docker name — every one resolves to `172.17.0.1`
 and is refused. That stack needs the machine's LAN IP instead.
 This one deliberately sets no `extra_hosts`, which is why the default above works.
+
+#### TLS to the gateway
+
+Port `9093` is the management API's TLS listener; the gateway serves it only
+when `[controller.server.tls]` is enabled with a certificate. The mediator
+verifies that certificate like any HTTPS client, TLS 1.2 or later:
+
+- **The certificate must name the host in `base_url`**: `host.docker.internal`
+  for the default, `172.17.0.1` on Docker Engine for Linux, `localhost` when the
+  mediator runs outside Docker.
+- **Its issuer must be trusted.** A certificate from a public CA needs nothing
+  more. For a self-signed or private-CA certificate, set `[gateway] ca_file` /
+  `SM_GATEWAY_CA_FILE` to a PEM bundle of that CA; it is trusted in addition to
+  the system roots. With compose, put it in `certs/` and point at
+  `/app/certs/<file>`.
+
+A wrong setup shows at startup, in the gateway reachability check:
+
+| Log says | Cause |
+|---|---|
+| `x509: certificate signed by unknown authority` | `ca_file` is not set, or holds a different CA |
+| `x509: certificate is valid for ..., not ...` | the certificate doesn't name the `base_url` host |
+| `connection refused` | the TLS listener is not enabled, or `9093` is not published |
+| `gateway.ca_file is set but gateway.base_url ... is not https` | the address still points at plain HTTP |
+| `failed to read the gateway CA file` / `holds no PEM certificate` | the path is wrong, or the file isn't PEM |
+
+The last two stop startup; the others leave the mediator running, and every
+delivery fails with `502` until the gateway is reachable.
 
 ### Being reached by the portal (inbound)
 
@@ -833,6 +880,7 @@ Dockerfile                   build context is THIS directory
 docker-compose.yaml          how it runs
 configs/config.toml          all configuration; mounted read-only
 configs/config-template.toml the annotated version to copy from
+certs/                       the gateway's CA certificate, if any; mounted read-only
 Makefile                     make build, make test, make build-and-push-multiarch
 deploy/helm/                 the Helm chart for Kubernetes
 cmd/subscription-mediator/   startup and wiring

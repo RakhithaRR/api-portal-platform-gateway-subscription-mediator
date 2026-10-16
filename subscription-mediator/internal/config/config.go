@@ -46,12 +46,13 @@ const (
 )
 
 // DefaultGatewayBaseURL is the address the mediator tries when nothing else says
-// otherwise. The mediator runs on its own Docker network and shares none with
-// the gateway, so the default is the host-published port a separate gateway
-// compose stack exposes, reached through Docker Desktop's host.docker.internal.
-// Every other layout — Docker Engine on Linux, a gateway on the host, one in
-// Kubernetes — is a matter of setting gateway.base_url or SM_GATEWAY_BASE_URL.
-const DefaultGatewayBaseURL = "http://host.docker.internal:9090/api/management/v1"
+// otherwise: the management API's TLS listener (9093), on the host port a
+// separate gateway compose stack publishes, reached through Docker Desktop's
+// host.docker.internal. The mediator runs on its own Docker network and shares
+// none with the gateway. Every other layout — Docker Engine on Linux, a gateway
+// on the host, one in Kubernetes — is a matter of setting gateway.base_url or
+// SM_GATEWAY_BASE_URL.
+const DefaultGatewayBaseURL = "https://host.docker.internal:9093/api/management/v1"
 
 // envKeys maps each recognized environment variable to the config key it sets.
 // It is explicit rather than derived from the key path: the paths contain
@@ -62,6 +63,7 @@ var envKeys = map[string]string{
 	"SM_GATEWAY_BASE_URL": "gateway.base_url",
 	"SM_GATEWAY_USERNAME": "gateway.username",
 	"SM_GATEWAY_PASSWORD": "gateway.password",
+	"SM_GATEWAY_CA_FILE":  "gateway.ca_file",
 	"SM_LOG_LEVEL":        "logging.level",
 }
 
@@ -107,6 +109,10 @@ type GatewayConfig struct {
 	BaseURL  string `koanf:"base_url"`
 	Username string `koanf:"username"`
 	Password string `koanf:"password"`
+	// CAFile is a PEM bundle of CA certificates trusted for the gateway's TLS
+	// listener, in addition to the system roots. Empty means the system roots
+	// alone, which suits a certificate from a public CA.
+	CAFile string `koanf:"ca_file"`
 }
 
 // LoggingConfig configures the logger.
@@ -240,6 +246,7 @@ func (c *Config) normalize() {
 	c.Gateway.BaseURL = strings.TrimRight(strings.TrimSpace(c.Gateway.BaseURL), "/")
 	c.Gateway.Username = strings.TrimSpace(c.Gateway.Username)
 	c.Gateway.Password = strings.TrimSpace(c.Gateway.Password)
+	c.Gateway.CAFile = strings.TrimSpace(c.Gateway.CAFile)
 	c.Logging.Level = strings.ToLower(strings.TrimSpace(c.Logging.Level))
 
 	// Resolution keys are matched case-insensitively, so fold them once here
@@ -266,12 +273,17 @@ func (c *Config) validate(path string, fileLoaded bool) error {
 	if c.Gateway.BaseURL == "" {
 		return missing(path, fileLoaded, "gateway.base_url",
 			"it addresses the Gateway Controller management REST API, "+
-				"e.g. \"http://host.docker.internal:9090/api/management/v1\"")
+				"e.g. \"https://host.docker.internal:9093/api/management/v1\"")
 	}
 	u, err := url.Parse(c.Gateway.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("invalid configuration: gateway.base_url must be an http(s) URL with a host, got %q "+
 			"(set it in %s or in %s)", c.Gateway.BaseURL, fileRef(path, fileLoaded), envKeyFor("gateway.base_url"))
+	}
+	if c.Gateway.CAFile != "" && u.Scheme != "https" {
+		return fmt.Errorf("invalid configuration: gateway.ca_file is set but gateway.base_url %q is not https, "+
+			"so the CA would never be used (set them in %s or in %s and %s)", c.Gateway.BaseURL,
+			fileRef(path, fileLoaded), envKeyFor("gateway.base_url"), envKeyFor("gateway.ca_file"))
 	}
 	if c.Gateway.Username == "" {
 		return missing(path, fileLoaded, "gateway.username",

@@ -57,7 +57,10 @@ func run() error {
 		return err
 	}
 
-	client := gateway.New(cfg.Gateway.BaseURL, cfg.Gateway.Username, cfg.Gateway.Password)
+	client, err := gateway.New(cfg.Gateway.BaseURL, cfg.Gateway.Username, cfg.Gateway.Password, cfg.Gateway.CAFile)
+	if err != nil {
+		return err
+	}
 	med := mediator.New(client, codec, cfg.APIHandles, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

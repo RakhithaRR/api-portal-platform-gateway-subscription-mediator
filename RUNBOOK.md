@@ -36,7 +36,7 @@ PODS="app.kubernetes.io/name=subscription-mediator,app.kubernetes.io/instance=$R
  ┌──────────────────────────────── AKS cluster ─────────────────────────────────┐
  │                                                                              │
  │  API Portal ── POST /devportal/events ──▶ subscription-mediator ──▶ Gateway Controller
- │  (webhook subscriber)   (ClusterIP svc)        Deployment, 2 replicas    management API :9090
+ │  (webhook subscriber)   (ClusterIP svc)        Deployment, 2 replicas    management API :9093 (TLS)
  │                                                (no state)
  └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -73,7 +73,7 @@ instructions.
 | 4 | Create a gateway user with the **admin** role for the mediator | The gateway's user configuration | `curl -u user:pass <gateway>/api/management/v1/subscription-plans` returns 200 |
 | 5 | Generate the webhook secret | `openssl rand -base64 48` | Stored in Key Vault (or your secret store) |
 | 6 | Create the namespace and credentials Secret | [chart README → Credentials](subscription-mediator/deploy/helm/subscription-mediator/README.md#1-credentials) | `kubectl -n $NS get secret subscription-mediator-credentials` |
-| 7 | Write the environment's values file from `examples/values-dev.yaml` | Fill in the gateway URL and the NetworkPolicy namespaces | `helm template` renders without errors |
+| 7 | Write the environment's values file from `examples/values-dev.yaml` | Fill in the gateway URL (`https://…:9093/api/management/v1` for its TLS listener, or `http://…:9090/api/management/v1` for plaintext), the gateway CA (`config.gateway.ca`) when using TLS with a self-signed or private certificate, and the NetworkPolicy namespaces and port | `helm template` renders without errors |
 | 8 | First install | [§3.3](#33-deploy-to-the-cluster) | Both pods are `Running`, and `helm test` passes |
 | 9 | Register the webhook subscriber in the API Portal | [Register the webhook subscriber](#register-the-webhook-subscriber) below | The subscriber is listed with `enabled: true`, and a test subscription appears on the gateway ([§3.4](#34-verify-end-to-end)) |
 | 10 | Mirror the subscription plans in the portal | [README §8](README.md#8-set-up-the-api-portal) | Plan names match the gateway's |
@@ -343,14 +343,20 @@ Logs show `event apply failed at the gateway`, the portal got a `502`, and its
 delivery history shows the deliveries `FAILED`.
 
 1. Is the gateway up? Check its pods and its own health.
-2. Can the mediator reach it? From inside a pod:
-   `kubectl -n $NS exec deploy/subscription-mediator -- wget -qO- -T5 <baseUrl>/subscription-plans`.
-   This call sends no credentials, so any HTTP reply, including `401`, proves
-   the network path works. A timeout or *connection refused* means it doesn't.
-   If the path works but the mediator still fails, check its credentials
-   ([§5.2](#52-rotate-the-gateway-credentials)).
+2. Why can't the mediator reach it? The `error` on the log line says, and so
+   does the reachability check a pod logs at startup
+   (`kubectl -n $NS rollout restart deployment/subscription-mediator`, then
+   read the new pod's first lines):
+
+   | Error contains | Cause |
+   |---|---|
+   | `x509: certificate signed by unknown authority` | `config.gateway.ca` is not set, or names a different CA |
+   | `x509: certificate is valid for ..., not ...` | the gateway's certificate doesn't name the `baseUrl` host |
+   | `connection refused` | the gateway's TLS listener (`9093`) is not enabled, or the Service doesn't expose it |
+   | `timeout` / `context deadline exceeded` | blocked on the network: see the next step |
+   | `401` | wrong gateway credentials ([§5.2](#52-rotate-the-gateway-credentials)) |
 3. Is it blocked? A timeout with the NetworkPolicy on usually means a wrong
-   `networkPolicy.egress.rules` namespace or port.
+   `networkPolicy.egress.rules` namespace or port; the port is `9093`.
 4. Is the URL right? Check `config.gateway.baseUrl` against the gateway
    controller Service: `kubectl -n <gateway-ns> get svc`.
 

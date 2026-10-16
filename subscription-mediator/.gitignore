@@ -1,3 +1,7 @@
 # Optional; holds the SM_* overrides (gateway base URL, credentials, secret,
 # published port) read by docker-compose.yaml. Never commit a filled-in one.
 .env
+
+# Certificates dropped in for the compose mount; only the placeholder is tracked.
+certs/*
+!certs/.gitkeep

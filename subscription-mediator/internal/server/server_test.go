@@ -39,7 +39,11 @@ func newTestServer(t *testing.T, gatewayStatus int) http.Handler {
 	if err != nil {
 		t.Fatalf("webhook.NewCodec() = %v", err)
 	}
-	med := mediator.New(gateway.New(gw.URL, "foo", "bar"), codec, map[string]string{}, logger)
+	client, err := gateway.New(gw.URL, "foo", "bar", "")
+	if err != nil {
+		t.Fatalf("gateway.New() = %v", err)
+	}
+	med := mediator.New(client, codec, map[string]string{}, logger)
 	return New(codec, med, logger).Handler()
 }
 

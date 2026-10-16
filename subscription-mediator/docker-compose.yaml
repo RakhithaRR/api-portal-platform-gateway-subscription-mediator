@@ -24,10 +24,15 @@ services:
       - SM_GATEWAY_BASE_URL
       - SM_GATEWAY_USERNAME
       - SM_GATEWAY_PASSWORD
+      - SM_GATEWAY_CA_FILE
       - SM_LOG_LEVEL
 
     volumes:
       - ./configs/config.toml:/app/config.toml:ro
+      # The gateway's CA certificate goes here when its TLS certificate is
+      # self-signed or from a private CA; point SM_GATEWAY_CA_FILE at it, e.g.
+      # /app/certs/gateway-ca.crt.
+      - ./certs:/app/certs:ro
 
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8085/health"]

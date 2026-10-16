@@ -55,8 +55,8 @@ Each portal action's webhook is described in the
 | Docker with Compose v2 | Desktop or Engine |
 | `curl`, `jq`, `openssl`, `unzip` | |
 
-Ports used: `9444` (API Manager, offset 1), `9090`/`8443` (gateway management /
-ingress), `9543`/`9243` (portal / platform API), `8085` (mediator). All must be
+Ports used: `9444` (API Manager, offset 1), `9090`/`9093`/`8443` (gateway
+management, plaintext and TLS / ingress), `9543`/`9243` (portal / platform API), `8085` (mediator). All must be
 free.
 
 ## How to run this
@@ -283,12 +283,52 @@ GATEWAY_CONTROLPLANE_ON_PREM=true
 APIP_GW_CONTROLLER_CONTROLPLANE_APIM_OAUTH2_CLIENT_ID=$CID
 APIP_GW_CONTROLLER_CONTROLPLANE_APIM_OAUTH2_CLIENT_SECRET=$CSEC
 EOF
-
-docker compose up -d
 ```
 
 `api-platform.env` now holds a registration token and an OAuth2 client secret.
 It is specific to this machine — never commit it.
+
+The mediator calls the management API on its **TLS listener** (`9093`), which
+serves the same API as the plaintext one on `9090`, is off by default and has no
+certificate. Give it a self-signed one whose names cover every host the mediator
+may use — `host.docker.internal` on Docker Desktop, `$HOST_ADDR` on Docker
+Engine (`172.17.0.1`):
+
+```bash
+mkdir -p gateway-controller/listener-certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -subj "/CN=gateway-management" \
+  -addext "subjectAltName=DNS:host.docker.internal,DNS:localhost,IP:127.0.0.1,IP:$HOST_ADDR" \
+  -keyout gateway-controller/listener-certs/mgmt-api.key \
+  -out gateway-controller/listener-certs/mgmt-api.crt
+```
+
+`gateway-controller/listener-certs/` is mounted read-only into the controller at
+`/app/listener-certs`. The listener is configured only in `configs/config.toml`
+— these keys have no environment-variable form:
+
+```bash
+if grep -q '^\[controller\.server\.tls\]' configs/config.toml; then
+  echo "EDIT: set enabled, port, cert_path, key_path in the existing [controller.server.tls] block"
+else
+  cat >> configs/config.toml <<'EOF'
+
+[controller.server.tls]
+enabled = true
+port = 9093
+cert_path = "/app/listener-certs/mgmt-api.crt"
+key_path = "/app/listener-certs/mgmt-api.key"
+EOF
+fi
+grep -q '"9093:9093"' docker-compose.yaml || echo 'EDIT: add - "9093:9093" under gateway-controller ports'
+```
+
+Act on any `EDIT:` line it prints — the block's values are the four shown in
+the heredoc — then start:
+
+```bash
+docker compose up -d
+```
 
 ```bash
 sleep 20
@@ -297,10 +337,20 @@ docker compose logs gateway-controller | grep -i "control plane connection"
 
 curl -s -o /dev/null -w "gw mgmt %{http_code}\n" -u "$GW_USER:$GW_PASS" "$GW_MGMT/rest-apis"
 # gw mgmt 200
+
+curl -s -o /dev/null -w "gw mgmt tls %{http_code}\n" -u "$GW_USER:$GW_PASS" \
+  --cacert gateway-controller/listener-certs/mgmt-api.crt \
+  https://localhost:9093/api/management/v1/subscription-plans
+# gw mgmt tls 200
 ```
 
 **Expected:** `Control plane connection established`, and `200` from the
-management API. `dial tcp 172.17.0.1:9444: connection refused` means
+management API on both listeners. `000` from the TLS check means the listener
+isn't up: `connection refused` is the block not enabled or `9093` not published;
+a certificate error is the `cert_path`/`key_path` pair; if the controller log
+says it cannot read the key, check the file's permissions against the
+container's user. The rest of this document keeps calling the plaintext
+`$GW_MGMT`; only the mediator uses `9093`. `dial tcp 172.17.0.1:9444: connection refused` means
 `APIP_GW_CONTROLLER_CONTROLPLANE_HOST` resolved through
 `host.docker.internal` — go back to S1 and use the LAN address.
 
@@ -357,14 +407,19 @@ The webhook secret does double duty: it signs each delivery *and* derives the
 key that encrypts the subscription token and API key inside it. The portal and
 the mediator must hold the same one.
 
+The gateway's management certificate from S5 is self-signed, so it is its own
+CA. The mediator's compose mounts `certs/` read-only at `/app/certs`.
+
 ```bash
 export WEBHOOK_SECRET=$(openssl rand -base64 48 | tr -d '\n')
 cd "$DEMO/subscription-mediator"
+cp "$GW_DIR/gateway-controller/listener-certs/mgmt-api.crt" certs/gateway-ca.crt
 cat > .env <<EOF
 SM_WEBHOOK_SECRET=$WEBHOOK_SECRET
 SM_GATEWAY_USERNAME=$GW_USER
 SM_GATEWAY_PASSWORD=$GW_PASS
-SM_GATEWAY_BASE_URL=http://host.docker.internal:9090/api/management/v1
+SM_GATEWAY_BASE_URL=https://host.docker.internal:9093/api/management/v1
+SM_GATEWAY_CA_FILE=/app/certs/gateway-ca.crt
 EOF
 
 make build
@@ -380,12 +435,23 @@ msg="the gateway management API is reachable and the credentials were accepted"
 msg="subscription-mediator is ready"
 ```
 
+A `could not reach the gateway management API` warning instead of the first
+line is a finding about the TLS setup; its error says which:
+`x509: certificate signed by unknown authority` is `SM_GATEWAY_CA_FILE` unset or
+pointing at another certificate; `x509: certificate is valid for ..., not ...`
+is a host in `SM_GATEWAY_BASE_URL` the certificate doesn't name;
+`connection refused` is the `9093` listener off or unpublished. A container that
+exits instead names a bad CA setting in its last log line — `ca_file is set but
+gateway.base_url ... is not https`, `failed to read the gateway CA file`, or
+`holds no PEM certificate`.
+
 The mediator keeps no state: there is no volume to clear between runs. Every
 lookup reads the gateway, so a gateway left with subscriptions or keys from an
 earlier run is what a clean run has to avoid, not the mediator.
 
-On Docker Engine for Linux use `http://172.17.0.1:9090/...` for
-`SM_GATEWAY_BASE_URL` — `host.docker.internal` is a Docker Desktop name.
+On Docker Engine for Linux use `https://172.17.0.1:9093/...` for
+`SM_GATEWAY_BASE_URL` — `host.docker.internal` is a Docker Desktop name. The
+certificate covers it because `$HOST_ADDR` is `172.17.0.1` there.
 
 ## S9 — Portal: webhook subscriber, plans, APIs
 

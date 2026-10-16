@@ -64,6 +64,22 @@
               "type": "string",
               "pattern": "^(https?://.+)?$",
               "description": "Gateway Controller management REST API URL"
+            },
+            "ca": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "secretName": {
+                  "type": "string"
+                },
+                "configMapName": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
             }
           }
         },

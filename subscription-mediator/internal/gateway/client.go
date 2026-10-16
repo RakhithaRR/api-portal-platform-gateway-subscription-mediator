@@ -22,12 +22,15 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -182,14 +185,42 @@ type Client struct {
 	http     *http.Client
 }
 
-// New builds a Client.
-func New(baseURL, username, password string) *Client {
+// New builds a Client. caFile, when set, names a PEM bundle of CA certificates
+// trusted for the gateway's TLS listener in addition to the system roots.
+func New(baseURL, username, password, caFile string) (*Client, error) {
+	tlsConfig, err := clientTLSConfig(caFile)
+	if err != nil {
+		return nil, err
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
 	return &Client{
 		baseURL:  strings.TrimRight(baseURL, "/"),
 		username: username,
 		password: password,
-		http:     &http.Client{Timeout: 15 * time.Second},
+		http:     &http.Client{Timeout: 15 * time.Second, Transport: transport},
+	}, nil
+}
+
+// clientTLSConfig trusts the system roots plus the certificates in caFile.
+func clientTLSConfig(caFile string) (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if caFile == "" {
+		return cfg, nil
 	}
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the gateway CA file: %w", err)
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil || roots == nil {
+		roots = x509.NewCertPool()
+	}
+	if !roots.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("the gateway CA file %s holds no PEM certificate", caFile)
+	}
+	cfg.RootCAs = roots
+	return cfg, nil
 }
 
 // do performs one request and decodes the response into out when non-nil.

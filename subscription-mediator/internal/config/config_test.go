@@ -390,3 +390,29 @@ func TestShippedConfigStartsOnceSupplied(t *testing.T) {
 		t.Errorf("the shipped gateway.base_url = %q, want %q", cfg.Gateway.BaseURL, DefaultGatewayBaseURL)
 	}
 }
+
+func TestGatewayCAFileComesFromTheEnvironment(t *testing.T) {
+	isolateEnv(t)
+	t.Setenv("SM_GATEWAY_CA_FILE", " /etc/subscription-mediator/gateway-ca/ca.crt ")
+
+	cfg, err := Load(write(t, minimalTOML))
+	if err != nil {
+		t.Fatalf("Load() = %v", err)
+	}
+	if cfg.Gateway.CAFile != "/etc/subscription-mediator/gateway-ca/ca.crt" {
+		t.Errorf("gateway.ca_file = %q, want the trimmed environment value", cfg.Gateway.CAFile)
+	}
+}
+
+// TestGatewayCAFileNeedsAnHTTPSAddress asserts a CA that could never be used
+// stops startup instead of being silently ignored.
+func TestGatewayCAFileNeedsAnHTTPSAddress(t *testing.T) {
+	isolateEnv(t)
+	t.Setenv("SM_GATEWAY_BASE_URL", "http://gateway:9090/api/management/v1")
+	t.Setenv("SM_GATEWAY_CA_FILE", "/etc/ca.crt")
+
+	_, err := Load(write(t, minimalTOML))
+	if err == nil || !strings.Contains(err.Error(), "ca_file") {
+		t.Fatalf("Load() with a CA and an http address = %v, want an error naming ca_file", err)
+	}
+}

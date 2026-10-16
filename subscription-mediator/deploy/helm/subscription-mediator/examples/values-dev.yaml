@@ -15,7 +15,12 @@ image:
 
 config:
   gateway:
-    baseUrl: http://<gateway-release>-gateway-controller.<gateway-namespace>.svc:9090/api/management/v1
+    baseUrl: https://<gateway-release>-gateway-controller.<gateway-namespace>.svc:9093/api/management/v1
+    # The CA that issued the gateway's TLS certificate, copied into this
+    # namespace (e.g. by cert-manager or trust-manager).
+    ca:
+      secretName: <gateway-ca-secret>
+      key: ca.crt
   logging:
     level: info
   apiHandles: {}
@@ -44,5 +49,5 @@ networkPolicy:
               matchLabels:
                 kubernetes.io/metadata.name: <gateway-namespace>
         ports:
-          - port: 9090
+          - port: 9093
             protocol: TCP

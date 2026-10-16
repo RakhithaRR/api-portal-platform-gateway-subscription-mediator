@@ -409,7 +409,10 @@ func newHarness(t *testing.T, fake *fakeGateway, overrides map[string]string) *h
 	if overrides == nil {
 		overrides = map[string]string{}
 	}
-	client := gateway.New(baseURL, "foo", "bar")
+	client, err := gateway.New(baseURL, "foo", "bar", "")
+	if err != nil {
+		t.Fatalf("gateway.New() = %v", err)
+	}
 	return &harness{med: New(client, codec, overrides, logger), fake: fake}
 }
 

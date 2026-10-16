@@ -2,6 +2,7 @@
 # gateway credentials; configs/config.toml is bind-mounted at run time.
 .env
 configs/
+certs/
 
 .git
 .gitignore

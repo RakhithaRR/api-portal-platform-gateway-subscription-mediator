@@ -83,6 +83,9 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 [gateway]
 base_url = {{ required "config.gateway.baseUrl is required: the Gateway Controller management REST API URL" .Values.config.gateway.baseUrl | toJson }}
+{{- with include "subscription-mediator.gatewayCAKey" . }}
+ca_file = {{ printf "/etc/gateway-ca/%s" . | toJson }}
+{{- end }}
 
 [logging]
 level = {{ .Values.config.logging.level | toJson }}
@@ -91,6 +94,20 @@ level = {{ .Values.config.logging.level | toJson }}
 {{- range $key, $handle := .Values.config.apiHandles }}
 {{ $key | toJson }} = {{ $handle | toJson }}
 {{- end }}
+{{- end }}
+
+{{/*
+The key of the gateway CA bundle to mount, or empty when none is configured.
+Fails when both a Secret and a ConfigMap are named, since only one is mounted.
+*/}}
+{{- define "subscription-mediator.gatewayCAKey" -}}
+{{- $ca := .Values.config.gateway.ca -}}
+{{- if and $ca.secretName $ca.configMapName -}}
+{{- fail "config.gateway.ca: set secretName or configMapName, not both" -}}
+{{- end -}}
+{{- if or $ca.secretName $ca.configMapName -}}
+{{- $ca.key -}}
+{{- end -}}
 {{- end }}
 
 {{/*

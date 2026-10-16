@@ -101,10 +101,33 @@ spec:
             - name: config
               mountPath: /etc/subscription-mediator
               readOnly: true
+            {{- if include "subscription-mediator.gatewayCAKey" . }}
+            # Read at startup: a changed CA takes effect on the next rollout.
+            - name: gateway-ca
+              mountPath: /etc/gateway-ca
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ $fullname }}
+        {{- with .Values.config.gateway.ca }}
+        {{- if .secretName }}
+        - name: gateway-ca
+          secret:
+            secretName: {{ .secretName }}
+            items:
+              - key: {{ .key }}
+                path: {{ .key }}
+        {{- else if .configMapName }}
+        - name: gateway-ca
+          configMap:
+            name: {{ .configMapName }}
+            items:
+              - key: {{ .key }}
+                path: {{ .key }}
+        {{- end }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
