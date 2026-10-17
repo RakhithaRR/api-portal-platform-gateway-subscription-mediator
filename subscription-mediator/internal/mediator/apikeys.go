@@ -14,7 +14,6 @@ import (
 // 36 characters, and the name must match ^[a-z0-9]+(-[a-z0-9]+)*$, 3..63 chars.
 const (
 	minInjectedKeyLength = 36
-	keyNameMinLength     = 3
 	keyNameMaxLength     = 63
 )
 
@@ -138,10 +137,15 @@ func (m *Mediator) listAPIKeys(ctx context.Context, apiHandle string) ([]gateway
 	return keys, nil
 }
 
-// liveKeyFor returns the key that carries the portal key ID and is not revoked.
+// liveKeyFor returns the key for the portal key ID that is not revoked: the one
+// named after it (gatewayKeyName), or, for a key created before keys were named
+// that way, the one carrying it as externalRefId. The name is what lasts: the
+// gateway clears a key's externalRefId when the key is updated (a regenerate).
 func liveKeyFor(keys []gateway.APIKey, portalKeyID string) *gateway.APIKey {
+	name := keyNameFor(portalKeyID)
 	for i := range keys {
-		if keys[i].ExternalRefID == portalKeyID && !strings.EqualFold(keys[i].Status, gateway.KeyStatusRevoked) {
+		if (keys[i].Name == name || keys[i].ExternalRefID == portalKeyID) &&
+			!strings.EqualFold(keys[i].Status, gateway.KeyStatusRevoked) {
 			return &keys[i]
 		}
 	}
@@ -181,51 +185,31 @@ func (m *Mediator) apiKeySecret(env *webhook.Envelope, data *webhook.APIKeyData)
 	return secret, nil
 }
 
-// gatewayKeyName picks the gateway name for a new key, from the portal's key
-// handle.
+// gatewayKeyName picks the gateway name for a new key: derived from the portal
+// key ID alone, so every later event for the key can find it by name.
 //
 // The gateway uses the name as a path parameter and constrains its characters,
-// so the handle is slugified. Two portal handles can slugify alike, and a
-// revoked key keeps its name, so when the name is already taken on the API the
-// start of the portal key ID is appended. Later lookups go by externalRefId, so
-// the name only has to be unique, not predictable.
+// so the ID is slugified. A portal key ID names one key for its whole life, so
+// the name is only ever taken by that same key — revoked, since a live one would
+// have been found and updated instead. Creating it again would revive a revoked
+// credential, so that is refused.
 func gatewayKeyName(data *webhook.APIKeyData, keys []gateway.APIKey) (string, error) {
-	base := slugify(data.Handle)
-	if base == "" {
-		base = slugify(data.DisplayName)
-	}
-	if base == "" {
-		base = slugify(data.KeyID) // a UUID is already name-safe once slugified
-	}
-	if base == "" {
-		base = "portal-key"
-	}
-	if len(base) > keyNameMaxLength {
-		base = strings.Trim(base[:keyNameMaxLength], "-")
-	}
-	for len(base) < keyNameMinLength {
-		base += "-k"
-	}
-	if !keyNameTaken(keys, base) {
-		return base, nil
-	}
-
-	suffix := slugify(data.KeyID)
-	if len(suffix) > 8 {
-		suffix = strings.Trim(suffix[:8], "-")
-	}
-	if suffix == "" {
-		suffix = "dup"
-	}
-	if trimTo := keyNameMaxLength - len(suffix) - 1; trimTo > 0 && len(base) > trimTo {
-		base = strings.Trim(base[:trimTo], "-")
-	}
-	name := base + "-" + suffix
+	name := keyNameFor(data.KeyID)
 	if keyNameTaken(keys, name) {
-		return "", permanentf("the gateway API already has keys named %q and %q; cannot pick a name for "+
-			"portal key %s", base, name, data.KeyID)
+		return "", permanentf("portal key %s was already revoked on the gateway (key %q); a revoked key is not "+
+			"recreated", data.KeyID, name)
 	}
 	return name, nil
+}
+
+// keyNameFor is the gateway key name for a portal key ID: "pk-" and the slugified
+// ID (a UUID fits in full), within the gateway's 3..63 characters.
+func keyNameFor(portalKeyID string) string {
+	name := "pk-" + slugify(portalKeyID)
+	if len(name) > keyNameMaxLength {
+		name = strings.Trim(name[:keyNameMaxLength], "-")
+	}
+	return name
 }
 
 func keyNameTaken(keys []gateway.APIKey, name string) bool {

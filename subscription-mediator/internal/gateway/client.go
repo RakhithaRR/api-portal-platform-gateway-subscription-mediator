@@ -7,16 +7,14 @@
 // shapes are those of gateway 1.2.0 and are not guaranteed against any other
 // release.
 //
-// The subscription operations also rely on three changes the 1.2.0 API does not
-// have yet (https://github.com/wso2/api-platform/issues/3782):
+// The subscription operations also rely on two changes the stock 1.2.0 API does
+// not have (https://github.com/wso2/api-platform/issues/3782, merged as
+// https://github.com/wso2/api-platform/pull/3804):
 //
-//   - POST /subscriptions accepts a caller-supplied referenceId;
-//   - GET /subscriptions filters on referenceId;
+//   - POST /subscriptions accepts an externalRefId, which becomes the
+//     subscription's ID, so GET/PUT/DELETE /subscriptions/{id} address it;
 //   - PUT /subscriptions/{id} is a partial update that also accepts
 //     subscriptionPlanId (null clears it) and subscriptionToken.
-//
-// The field and query names are in one place, ReferenceIDField, so they can
-// follow whatever the gateway ships.
 package gateway
 
 import (
@@ -35,9 +33,10 @@ import (
 	"time"
 )
 
-// ReferenceIDField is the subscription field, and the GET /subscriptions query
-// parameter, that carries a caller-supplied reference ID.
-const ReferenceIDField = "referenceId"
+// ExternalRefIDField is the POST /subscriptions field that sets a caller-chosen
+// subscription ID (wso2/api-platform#3804). The gateway stores the subscription
+// under that ID, so it is read back with GET /subscriptions/{id}.
+const ExternalRefIDField = "externalRefId"
 
 // Subscription statuses the gateway accepts.
 const (
@@ -110,7 +109,7 @@ type SubscriptionPlan struct {
 // Subscription is a gateway subscription.
 type Subscription struct {
 	ID                 string `json:"id"`
-	ReferenceID        string `json:"referenceId,omitempty"`
+	ExternalRefID      string `json:"externalRefId,omitempty"`
 	APIID              string `json:"apiId"`
 	ApplicationID      string `json:"applicationId,omitempty"`
 	SubscriptionPlanID string `json:"subscriptionPlanId,omitempty"`
@@ -119,9 +118,11 @@ type Subscription struct {
 
 // SubscriptionCreateRequest is the body of POST /subscriptions.
 type SubscriptionCreateRequest struct {
-	// ReferenceID is the caller's own identifier for the subscription, which
-	// every later lookup uses instead of the gateway's generated ID.
-	ReferenceID        string `json:"referenceId,omitempty"`
+	// ExternalRefID is the caller's own identifier for the subscription. The
+	// gateway uses it as the subscription ID instead of generating one, so every
+	// later lookup, update and delete addresses the subscription by it. It must
+	// match ^[A-Za-z0-9][A-Za-z0-9._-]*$ and be at most 64 characters.
+	ExternalRefID      string `json:"externalRefId,omitempty"`
 	APIID              string `json:"apiId"`
 	SubscriptionToken  string `json:"subscriptionToken"`
 	ApplicationID      string `json:"applicationId,omitempty"`
@@ -324,33 +325,24 @@ func (c *Client) CreateSubscription(ctx context.Context, req *SubscriptionCreate
 	return &sub, err
 }
 
-// FindSubscription returns the subscription carrying a reference ID, or nil
-// when the gateway has none.
-func (c *Client) FindSubscription(ctx context.Context, referenceID string) (*Subscription, error) {
-	query := url.Values{}
-	query.Set(ReferenceIDField, referenceID)
-	var resp struct {
-		Subscriptions []Subscription `json:"subscriptions"`
+// FindSubscription returns the subscription created with externalRefId, or nil
+// when the gateway has none. The externalRefId is the subscription's ID.
+func (c *Client) FindSubscription(ctx context.Context, externalRefID string) (*Subscription, error) {
+	var sub Subscription
+	err := c.do(ctx, http.MethodGet, "/subscriptions/"+url.PathEscape(externalRefID), nil, nil, &sub)
+	if apiErr, ok := AsAPIError(err); ok && apiErr.IsNotFound() {
+		return nil, nil
 	}
-	if err := c.do(ctx, http.MethodGet, "/subscriptions", query, nil, &resp); err != nil {
+	if err != nil {
 		return nil, err
 	}
-	// Matched again here so a gateway that ignored the filter returns nothing
-	// rather than somebody else's subscription.
-	var found []Subscription
-	for _, sub := range resp.Subscriptions {
-		if sub.ReferenceID == referenceID {
-			found = append(found, sub)
-		}
+	// Checked again so a gateway without caller-set IDs (one that predates
+	// wso2/api-platform#3804) can't hand back somebody else's subscription.
+	if sub.ID != externalRefID {
+		return nil, fmt.Errorf("the gateway returned subscription %q for ID %q; it may not support %s",
+			sub.ID, externalRefID, ExternalRefIDField)
 	}
-	switch len(found) {
-	case 0:
-		return nil, nil
-	case 1:
-		return &found[0], nil
-	default:
-		return nil, fmt.Errorf("the gateway holds %d subscriptions with %s %q", len(found), ReferenceIDField, referenceID)
-	}
+	return &sub, nil
 }
 
 // UpdateSubscription applies a partial update.

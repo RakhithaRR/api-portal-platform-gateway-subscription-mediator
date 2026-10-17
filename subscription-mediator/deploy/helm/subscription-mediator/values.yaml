@@ -28,16 +28,16 @@ imagePullSecrets: []
 # `secret` below.
 config:
   gateway:
-    # The Gateway Controller management REST API. The address picks the
-    # listener. In the same cluster, use the controller Service's DNS name:
-    #   https://<release>-gateway-controller.<namespace>.svc:9093/api/management/v1
-    #     the TLS listener; the gateway's certificate must name that host
+    # The Gateway Controller management REST API. In the same cluster, use the
+    # controller Service's DNS name:
     #   http://<release>-gateway-controller.<namespace>.svc:9090/api/management/v1
-    #     the plaintext listener; leave `ca` below empty
-    # Match networkPolicy.egress.rules to the port you choose.
+    # The gateway 1.2.0 controller serves it over plain HTTP only and has no TLS
+    # listener; use an https address only for a TLS-terminating proxy or ingress
+    # in front of it, whose certificate must name that host.
+    # Match networkPolicy.egress.rules to the port (9090, or the proxy's).
     baseUrl: ""
-    # The CA that issued the gateway's certificate, when it is self-signed or
-    # from a private CA. Name a Secret (e.g. cert-manager's, with ca.crt) or a
+    # For an https baseUrl only (leave empty for http): the CA that issued the
+    # proxy's certificate, when it is self-signed or from a private CA. Name a Secret (e.g. cert-manager's, with ca.crt) or a
     # ConfigMap (e.g. a trust-manager bundle), not both. It is trusted in
     # addition to the system roots, and read at startup.
     ca:
@@ -192,7 +192,7 @@ networkPolicy:
     #          matchLabels:
     #            app.kubernetes.io/component: controller
     #    ports:
-    #      - port: 9093
+    #      - port: 9090
     #        protocol: TCP
 
 # `helm test <release>` runs a pod that calls /health through the Service.

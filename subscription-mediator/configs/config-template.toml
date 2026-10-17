@@ -37,32 +37,27 @@
 secret = ""
 
 [gateway]
-# The Gateway Controller management REST API. The address picks the listener:
-#
-#   https://<host>:9093/api/management/v1   the TLS listener (the default)
-#   http://<host>:9090/api/management/v1    the plaintext listener; leave
-#                                           ca_file empty
+# The Gateway Controller management REST API. The gateway 1.2.0 controller
+# serves it over plain HTTP on 9090 and has no TLS listener of its own; use an
+# https address only for a TLS-terminating proxy or ingress in front of it.
 #
 # The mediator runs on its own network and shares none with the gateway, so it
 # reaches it the way anything outside that deployment does — over the host, or
 # over the network for a remote one. The default below suits the common case: the
-# gateway is its own compose stack publishing 9093, and Docker Desktop provides
+# gateway is its own compose stack publishing 9090, and Docker Desktop provides
 # host.docker.internal. Other layouts:
 #
-#   https://172.17.0.1:9093/api/management/v1       Docker Engine on Linux, where
+#   http://172.17.0.1:9090/api/management/v1        Docker Engine on Linux, where
 #                                                   host.docker.internal does not
 #                                                   exist
-#   https://localhost:9093/api/management/v1        mediator run outside Docker
-#   https://gateway.example.com/api/management/v1   gateway in Kubernetes, or any
-#                                                   remote address
-#
-# The certificate's names must include the host used here: host.docker.internal
-# for the default.
-base_url = "https://host.docker.internal:9093/api/management/v1"
+#   http://localhost:9090/api/management/v1         mediator run outside Docker
+#   http://<service>.<namespace>:9090/api/management/v1   gateway in Kubernetes
+#   https://gateway-mgmt.example.com/api/management/v1    behind a TLS proxy
+base_url = "http://host.docker.internal:9090/api/management/v1"
 
-# A PEM bundle of the CA certificates that issued the gateway's TLS certificate,
-# trusted in addition to the system roots. Needed when the gateway's certificate
-# is self-signed or from a private CA; leave empty for a public CA.
+# For an https base_url only: a PEM bundle of the CA certificates that issued
+# the proxy's TLS certificate, trusted in addition to the system roots. Needed
+# when that certificate is self-signed or from a private CA.
 ca_file = ""
 
 # Needs the admin role: every subscription and subscription-plan operation on

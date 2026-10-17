@@ -81,15 +81,17 @@ Three values are required, and the chart refuses to render without them:
 - `image.repository`
 - `image.tag` or `image.digest`: the immutable `sha-<commit>` tag CI pushes,
   never `dev`.
-- `config.gateway.baseUrl`: the management API. Its scheme and port pick the
-  listener: `https://<release>-gateway-controller.<namespace>.svc:9093/api/management/v1`
-  for TLS, where the gateway's certificate must name that host, or
-  `http://…:9090/api/management/v1` for plaintext.
+- `config.gateway.baseUrl`: the management API,
+  `http://<release>-gateway-controller.<namespace>.svc:9090/api/management/v1`.
+  The gateway 1.2.0 controller serves it over plain HTTP only; it has no TLS
+  listener. For TLS, put a TLS-terminating proxy or ingress in front of it and
+  use that `https` address, whose certificate must name that host. Allow the
+  same port (`9090`, or the proxy's) in `networkPolicy.egress.rules`.
 
 You must also set `secret.existingSecret`, or `secret.create=true` with the
 credential values.
 
-When the gateway's certificate is self-signed or from a private CA, give the
+When that proxy's certificate is self-signed or from a private CA, give the
 mediator that CA with `config.gateway.ca`: the name of a Secret (for example
 cert-manager's, which carries `ca.crt`) or a ConfigMap (for example a
 trust-manager bundle) in the mediator's namespace, and the key holding the PEM.
@@ -164,8 +166,8 @@ values at install time. The ones most installs set:
 |---|---|---|
 | `image.repository` | `""` | e.g. `myregistry.azurecr.io/subscription-mediator` |
 | `image.tag` / `image.digest` | `""` | the build to run. A digest wins over a tag. |
-| `config.gateway.baseUrl` | `""` | Gateway Controller management API URL: `https://…:9093` (TLS) or `http://…:9090` (plaintext) |
-| `config.gateway.ca.secretName` / `.configMapName` | `""` | the gateway's CA, when self-signed or private; one of the two. TLS only |
+| `config.gateway.baseUrl` | `""` | Gateway Controller management API URL: `http://…:9090/api/management/v1`, or `https://…` for a TLS-terminating proxy in front of it |
+| `config.gateway.ca.secretName` / `.configMapName` | `""` | the TLS proxy's CA, when self-signed or private; one of the two. `https` only |
 | `config.gateway.ca.key` | `ca.crt` | the key holding the PEM in that Secret or ConfigMap |
 | `config.logging.level` | `info` | `debug`, `info`, `warn` or `error` |
 | `config.apiHandles` | `{}` | `"<name>:<version>": <gateway-handle>` pins |
@@ -180,7 +182,7 @@ values at install time. The ones most installs set:
 
 ```bash
 helm lint subscription-mediator/deploy/helm/subscription-mediator \
-  --set image.repository=r/sm,image.tag=t,config.gateway.baseUrl=https://gw:9093,secret.existingSecret=s
+  --set image.repository=r/sm,image.tag=t,config.gateway.baseUrl=http://gw:9090/api/management/v1,secret.existingSecret=s
 helm template t subscription-mediator/deploy/helm/subscription-mediator -f examples/values-dev.yaml \
   --set image.tag=t | kubeconform -strict -summary
 ```

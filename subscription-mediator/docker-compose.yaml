@@ -18,7 +18,8 @@ services:
     ports:
       - "${SM_PUBLISHED_HOST:-0.0.0.0}:${SM_PUBLISHED_PORT:-8085}:8085"
 
-    # Injected settings, taken from the shell or a .env file beside this one when set.
+    # Injected settings, taken from the shell or a .env file beside this one when set
+    # (cp .env.example .env to start one).
     environment:
       - SM_WEBHOOK_SECRET
       - SM_GATEWAY_BASE_URL
@@ -29,9 +30,10 @@ services:
 
     volumes:
       - ./configs/config.toml:/app/config.toml:ro
-      # The gateway's CA certificate goes here when its TLS certificate is
-      # self-signed or from a private CA; point SM_GATEWAY_CA_FILE at it, e.g.
-      # /app/certs/gateway-ca.crt.
+      # Only for an https SM_GATEWAY_BASE_URL (a TLS-terminating proxy in front of
+      # the controller, which itself serves plain HTTP on 9090): the proxy's CA
+      # certificate goes here when it is self-signed or from a private CA; point
+      # SM_GATEWAY_CA_FILE at it, e.g. /app/certs/gateway-ca.crt.
       - ./certs:/app/certs:ro
 
     healthcheck:

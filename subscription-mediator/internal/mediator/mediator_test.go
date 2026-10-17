@@ -30,8 +30,8 @@ const (
 
 // fakeGateway stands in for the Gateway Controller management REST API, with
 // the subscription changes the mediator relies on: a caller-supplied
-// referenceId, a referenceId filter, and a partial PUT that takes the plan and
-// the token. The tests assert on the gateway's end state rather than on the
+// externalRefId that becomes the subscription ID, and a partial PUT that takes
+// the plan and the token. The tests assert on the gateway's end state rather than on the
 // mediator's own calls.
 type fakeGateway struct {
 	mu     sync.Mutex
@@ -165,17 +165,21 @@ func (f *fakeGateway) start(t *testing.T) string {
 			writeJSON(w, 400, map[string]string{"message": "Subscription plan is not enabled for this API"})
 			return
 		}
-		// Mirror the gateway's uniqueness: one token per API, and one
-		// subscription per reference ID.
+		// Mirror the gateway's uniqueness: one token per API, and the
+		// externalRefId is the primary key.
 		for id, sub := range f.subs {
 			if (sub.APIID == req.APIID && f.tokens[id] == req.SubscriptionToken) ||
-				(req.ReferenceID != "" && sub.ReferenceID == req.ReferenceID) {
+				(req.ExternalRefID != "" && id == req.ExternalRefID) {
 				writeJSON(w, 409, map[string]string{"message": "Subscription already exists"})
 				return
 			}
 		}
+		subID := req.ExternalRefID
+		if subID == "" {
+			subID = f.id("sub")
+		}
 		sub := &gateway.Subscription{
-			ID: f.id("sub"), ReferenceID: req.ReferenceID, APIID: req.APIID, ApplicationID: req.ApplicationID,
+			ID: subID, ExternalRefID: req.ExternalRefID, APIID: req.APIID, ApplicationID: req.ApplicationID,
 			SubscriptionPlanID: req.SubscriptionPlanID, Status: req.Status,
 		}
 		f.subs[sub.ID] = sub
@@ -183,17 +187,15 @@ func (f *fakeGateway) start(t *testing.T) string {
 		writeJSON(w, 201, sub)
 	})
 
-	mux.HandleFunc("GET /api/management/v1/subscriptions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/management/v1/subscriptions/{subscriptionId}", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		refID := r.URL.Query().Get(gateway.ReferenceIDField)
-		out := make([]gateway.Subscription, 0, len(f.subs))
-		for _, sub := range f.subs {
-			if refID == "" || sub.ReferenceID == refID {
-				out = append(out, *sub)
-			}
+		sub, ok := f.subs[r.PathValue("subscriptionId")]
+		if !ok {
+			writeJSON(w, 404, map[string]string{"message": "Subscription not found"})
+			return
 		}
-		writeJSON(w, 200, map[string]any{"subscriptions": out})
+		writeJSON(w, 200, sub)
 	})
 
 	mux.HandleFunc("PUT /api/management/v1/subscriptions/{subscriptionId}", func(w http.ResponseWriter, r *http.Request) {
@@ -300,6 +302,9 @@ func (f *fakeGateway) start(t *testing.T) string {
 			return
 		}
 		f.values[mapKey] = req.APIKey
+		// Like gateway 1.2.0: an update rewrites external_ref_id from a value it
+		// never sets, so the key loses its externalRefId.
+		key.ExternalRefID = ""
 		writeJSON(w, 200, map[string]any{"apiKey": key})
 	})
 
@@ -511,8 +516,8 @@ func TestSubscriptionCreatedBecomesAGatewaySubscription(t *testing.T) {
 	}
 
 	sub, token := fake.onlySub(t)
-	if sub.ReferenceID != "portal-sub-1" {
-		t.Errorf("referenceId = %q, want the portal subscription ID", sub.ReferenceID)
+	if sub.ID != "portal-sub-1" {
+		t.Errorf("subscription ID = %q, want the portal subscription ID", sub.ID)
 	}
 	if sub.APIID != "order-api-v1.0" {
 		t.Errorf("apiId = %q, want the gateway handle", sub.APIID)
@@ -765,7 +770,7 @@ func TestTokenRegenerationCreatesAMissingSubscription(t *testing.T) {
 		t.Fatalf("Handle(subscription.token_regenerated) with no subscription = %v", err)
 	}
 	sub, token := fake.onlySub(t)
-	if sub.ReferenceID != "portal-sub-1" || token != rotated {
+	if sub.ID != "portal-sub-1" || token != rotated {
 		t.Errorf("created %+v with token %q, want the portal subscription with the rotated token", sub, token)
 	}
 }
@@ -835,8 +840,8 @@ func TestDeleteFindsTheRightSubscriptionAmongMany(t *testing.T) {
 		t.Fatalf("Handle(subscription.deleted) = %v", err)
 	}
 	remaining, _ := fake.onlySub(t)
-	if remaining.ReferenceID != "portal-sub-bob" {
-		t.Errorf("the remaining subscription is %q, want bob's", remaining.ReferenceID)
+	if remaining.ID != "portal-sub-bob" {
+		t.Errorf("the remaining subscription is %q, want bob's", remaining.ID)
 	}
 }
 
@@ -870,12 +875,12 @@ func TestDuplicateCreateConvergesOnTheExistingSubscription(t *testing.T) {
 }
 
 // TestConflictWithSomebodyElsesSubscriptionFailsPermanently asserts a 409 is
-// only treated as a duplicate when the existing subscription carries this
-// event's reference ID.
+// only treated as a duplicate when the gateway holds a subscription under this
+// event's subscription ID.
 func TestConflictWithSomebodyElsesSubscriptionFailsPermanently(t *testing.T) {
 	fake := newFakeGateway()
 	fake.addAPI("Order API", "v1.0", "order-api-v1.0")
-	fake.subs["sub-other"] = &gateway.Subscription{ID: "sub-other", ReferenceID: "someone-else", APIID: "order-api-v1.0"}
+	fake.subs["sub-other"] = &gateway.Subscription{ID: "sub-other", ExternalRefID: "sub-other", APIID: "order-api-v1.0"}
 	fake.tokens["sub-other"] = testToken
 	h := newHarness(t, fake, nil)
 
@@ -950,6 +955,9 @@ func TestTransientGatewayFailureIsNotPermanent(t *testing.T) {
 
 // --- API keys --------------------------------------------------------------
 
+// TestAPIKeyLifecycle runs generate, regenerate and revoke. The fake gateway,
+// like the real one, drops a key's externalRefId on update, so the revoke only
+// lands if the key is found by its name.
 func TestAPIKeyLifecycle(t *testing.T) {
 	fake := newFakeGateway()
 	fake.addAPI("Order API", "v1.0", "order-api-v1.0")
@@ -959,7 +967,7 @@ func TestAPIKeyLifecycle(t *testing.T) {
 	if err := h.handle(t, keyEvent(t, "evt-1", webhook.EventAPIKeyGenerated, "portal-key-1", "my-production-key", secret)); err != nil {
 		t.Fatalf("Handle(apikey.generated) = %v", err)
 	}
-	key, value, ok := fake.key("order-api-v1.0", "my-production-key")
+	key, value, ok := fake.key("order-api-v1.0", keyNameFor("portal-key-1"))
 	if !ok || value != secret {
 		t.Fatal("the gateway did not receive the portal's own key value")
 	}
@@ -971,21 +979,21 @@ func TestAPIKeyLifecycle(t *testing.T) {
 	if err := h.handle(t, keyEvent(t, "evt-2", webhook.EventAPIKeyRegenerated, "portal-key-1", "my-production-key", rotated)); err != nil {
 		t.Fatalf("Handle(apikey.regenerated) = %v", err)
 	}
-	if _, value, _ := fake.key("order-api-v1.0", "my-production-key"); value != rotated {
+	if _, value, _ := fake.key("order-api-v1.0", keyNameFor("portal-key-1")); value != rotated {
 		t.Error("the gateway still holds the old key value")
 	}
 
 	if err := h.handle(t, keyEvent(t, "evt-3", webhook.EventAPIKeyRevoked, "portal-key-1", "my-production-key", "")); err != nil {
 		t.Fatalf("Handle(apikey.revoked) = %v", err)
 	}
-	if key, _, _ := fake.key("order-api-v1.0", "my-production-key"); key.Status != gateway.KeyStatusRevoked {
+	if key, _, _ := fake.key("order-api-v1.0", keyNameFor("portal-key-1")); key.Status != gateway.KeyStatusRevoked {
 		t.Errorf("status = %q, want the key revoked", key.Status)
 	}
 }
 
-// TestCollidingKeyHandlesAreToldApart tells keys apart by the portal key ID, not stored
-// state: two handles that slugify alike get distinct gateway names, and
-// revoking one leaves the other alone.
+// TestCollidingKeyHandlesAreToldApart: two handles that slugify alike still get
+// distinct gateway names, since names come from the portal key ID, and revoking
+// one leaves the other alone.
 func TestCollidingKeyHandlesAreToldApart(t *testing.T) {
 	fake := newFakeGateway()
 	fake.addAPI("Order API", "v1.0", "order-api-v1.0")
@@ -1002,14 +1010,14 @@ func TestCollidingKeyHandlesAreToldApart(t *testing.T) {
 	if fake.keyCount() != 2 {
 		t.Fatalf("the gateway holds %d keys, want 2", fake.keyCount())
 	}
-	if _, value, _ := fake.key("order-api-v1.0", "my-key"); value != aliceKey {
+	if _, value, _ := fake.key("order-api-v1.0", keyNameFor("key-alice-0001")); value != aliceKey {
 		t.Error("the second key overwrote the first")
 	}
 
 	if err := h.handle(t, keyEvent(t, "evt-3", webhook.EventAPIKeyRevoked, "key-bob-0002", "my_key", "")); err != nil {
 		t.Fatalf("revoke bob = %v", err)
 	}
-	if alice, _, _ := fake.key("order-api-v1.0", "my-key"); alice.Status == gateway.KeyStatusRevoked {
+	if alice, _, _ := fake.key("order-api-v1.0", keyNameFor("key-alice-0001")); alice.Status == gateway.KeyStatusRevoked {
 		t.Fatal("revoking bob's key revoked alice's")
 	}
 	fake.mu.Lock()
@@ -1037,8 +1045,9 @@ func TestDuplicateGenerateKeepsOneKey(t *testing.T) {
 	}
 }
 
-// TestNewKeyReusingARevokedHandleGetsItsOwnName covers a revoked key keeping
-// its name on the gateway.
+// TestNewKeyReusingARevokedHandleGetsItsOwnName: a new portal key with the
+// handle of a revoked one gets its own gateway key, and the revoked one stays
+// revoked.
 func TestNewKeyReusingARevokedHandleGetsItsOwnName(t *testing.T) {
 	fake := newFakeGateway()
 	fake.addAPI("Order API", "v1.0", "order-api-v1.0")
@@ -1059,8 +1068,32 @@ func TestNewKeyReusingARevokedHandleGetsItsOwnName(t *testing.T) {
 	if fake.keyCount() != 2 {
 		t.Fatalf("the gateway holds %d keys, want the revoked one and the new one", fake.keyCount())
 	}
-	if old, _, _ := fake.key("order-api-v1.0", "my-key"); old.Status != gateway.KeyStatusRevoked {
+	if old, _, _ := fake.key("order-api-v1.0", keyNameFor("portal-key-1")); old.Status != gateway.KeyStatusRevoked {
 		t.Error("the new key revived the revoked one")
+	}
+}
+
+// TestRevokedKeyIsNotRecreated: a generate for a portal key the gateway holds
+// revoked (a late duplicate delivery) must not bring the credential back.
+func TestRevokedKeyIsNotRecreated(t *testing.T) {
+	fake := newFakeGateway()
+	fake.addAPI("Order API", "v1.0", "order-api-v1.0")
+	h := newHarness(t, fake, nil)
+
+	const secret = "apip_3333333333333333333333333333333333333333333333333333333333333333"
+	for i, body := range [][]byte{
+		keyEvent(t, "evt-1", webhook.EventAPIKeyGenerated, "portal-key-1", "my-key", secret),
+		keyEvent(t, "evt-2", webhook.EventAPIKeyRevoked, "portal-key-1", "my-key", ""),
+	} {
+		if err := h.handle(t, body); err != nil {
+			t.Fatalf("step %d = %v", i+1, err)
+		}
+	}
+	if err := h.handle(t, keyEvent(t, "evt-3", webhook.EventAPIKeyGenerated, "portal-key-1", "my-key", secret)); !IsPermanent(err) {
+		t.Fatalf("generate of a revoked key = %v, want a permanent failure", err)
+	}
+	if key, _, _ := fake.key("order-api-v1.0", keyNameFor("portal-key-1")); key.Status != gateway.KeyStatusRevoked {
+		t.Error("the revoked key was brought back")
 	}
 }
 
@@ -1084,7 +1117,7 @@ func TestRegenerateCreatesTheKeyWhenGenerateWasMissed(t *testing.T) {
 	if err := h.handle(t, keyEvent(t, "evt-1", webhook.EventAPIKeyRegenerated, "portal-key-1", "orphan-key", secret)); err != nil {
 		t.Fatalf("Handle() with no prior key = %v", err)
 	}
-	if _, value, ok := fake.key("order-api-v1.0", "orphan-key"); !ok || value != secret {
+	if _, value, ok := fake.key("order-api-v1.0", keyNameFor("portal-key-1")); !ok || value != secret {
 		t.Error("the mediator did not create the key a missed generate would have")
 	}
 }

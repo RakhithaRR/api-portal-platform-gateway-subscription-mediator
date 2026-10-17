@@ -46,13 +46,15 @@ const (
 )
 
 // DefaultGatewayBaseURL is the address the mediator tries when nothing else says
-// otherwise: the management API's TLS listener (9093), on the host port a
-// separate gateway compose stack publishes, reached through Docker Desktop's
+// otherwise: the management API (9090, plain HTTP — the gateway 1.2.0 controller
+// has no TLS listener of its own), on the host port a separate gateway compose
+// stack publishes, reached through Docker Desktop's
 // host.docker.internal. The mediator runs on its own Docker network and shares
 // none with the gateway. Every other layout — Docker Engine on Linux, a gateway
 // on the host, one in Kubernetes — is a matter of setting gateway.base_url or
-// SM_GATEWAY_BASE_URL.
-const DefaultGatewayBaseURL = "https://host.docker.internal:9093/api/management/v1"
+// SM_GATEWAY_BASE_URL; so is an https address, for a gateway behind a
+// TLS-terminating proxy or ingress.
+const DefaultGatewayBaseURL = "http://host.docker.internal:9090/api/management/v1"
 
 // envKeys maps each recognized environment variable to the config key it sets.
 // It is explicit rather than derived from the key path: the paths contain
@@ -273,7 +275,7 @@ func (c *Config) validate(path string, fileLoaded bool) error {
 	if c.Gateway.BaseURL == "" {
 		return missing(path, fileLoaded, "gateway.base_url",
 			"it addresses the Gateway Controller management REST API, "+
-				"e.g. \"https://host.docker.internal:9093/api/management/v1\"")
+				"e.g. \"http://host.docker.internal:9090/api/management/v1\"")
 	}
 	u, err := url.Parse(c.Gateway.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {

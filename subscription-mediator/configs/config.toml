@@ -2,7 +2,7 @@
 secret = ""
 
 [gateway]
-base_url = "https://host.docker.internal:9093/api/management/v1"
+base_url = "http://host.docker.internal:9090/api/management/v1"
 ca_file = ""
 username = ""
 password = ""

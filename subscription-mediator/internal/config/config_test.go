@@ -393,6 +393,7 @@ func TestShippedConfigStartsOnceSupplied(t *testing.T) {
 
 func TestGatewayCAFileComesFromTheEnvironment(t *testing.T) {
 	isolateEnv(t)
+	t.Setenv("SM_GATEWAY_BASE_URL", "https://gateway-mgmt.example.com/api/management/v1")
 	t.Setenv("SM_GATEWAY_CA_FILE", " /etc/subscription-mediator/gateway-ca/ca.crt ")
 
 	cfg, err := Load(write(t, minimalTOML))

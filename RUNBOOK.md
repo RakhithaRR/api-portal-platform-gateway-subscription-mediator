@@ -7,7 +7,7 @@ document is the *what to do*.
 
 | | |
 |---|---|
-| Service | `subscription-mediator`: bridges API Portal 1.0.0 webhooks to the API Platform Gateway management API. Needs the gateway's subscription `referenceId` and partial `PUT` support, which 1.2.0 lacks ([wso2/api-platform#3782](https://github.com/wso2/api-platform/issues/3782)) |
+| Service | `subscription-mediator`: bridges API Portal 1.0.0 webhooks to the API Platform Gateway management API. Needs a gateway controller that includes [wso2/api-platform#3804](https://github.com/wso2/api-platform/pull/3804) (issue [#3782](https://github.com/wso2/api-platform/issues/3782)): `POST /subscriptions` with an `externalRefId` that becomes the subscription's `id`, and a partial `PUT /subscriptions/{id}`. Stock 1.2.0 does not; `thivindu/gateway-controller:1.2.0.17-SNAPSHOT` does (the base controller image of the custom gateway build) |
 | Environment | dev (AKS) |
 | Image | `<registry>.azurecr.io/subscription-mediator`, tags `sha-<commit>` and `dev` |
 | Kubernetes | namespace `subscription-mediator`, Helm release `subscription-mediator`, Deployment `subscription-mediator` (2 replicas), no volumes |
@@ -36,7 +36,7 @@ PODS="app.kubernetes.io/name=subscription-mediator,app.kubernetes.io/instance=$R
  ┌──────────────────────────────── AKS cluster ─────────────────────────────────┐
  │                                                                              │
  │  API Portal ── POST /devportal/events ──▶ subscription-mediator ──▶ Gateway Controller
- │  (webhook subscriber)   (ClusterIP svc)        Deployment, 2 replicas    management API :9093 (TLS)
+ │  (webhook subscriber)   (ClusterIP svc)        Deployment, 2 replicas    management API :9090 (HTTP)
  │                                                (no state)
  └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -51,8 +51,10 @@ Three facts drive almost every procedure in this runbook:
    resent. Recovery is to fix the cause and repeat the action in the portal.
    See [§6.4](#64-recovering-failed-deliveries).
 2. **The mediator keeps no state.** No volume, no queue, no stored tokens.
-   Subscriptions are found on the gateway by their `referenceId` (the portal
-   subscription ID), and API keys by their `externalRefId` (the portal key ID).
+   Subscriptions are created on the gateway with the portal subscription ID as
+   their `externalRefId`, which becomes their gateway `id`, so
+   `GET /subscriptions/{portal subscription ID}` finds them; API keys are
+   named `pk-<portal key ID>` and found by that name.
    Any replica can take any delivery.
 3. **Keep two or more replicas.** With two, a rolling restart, upgrade or node
    drain always leaves a pod to deliver to. With one, every restart is a gap
@@ -73,7 +75,7 @@ instructions.
 | 4 | Create a gateway user with the **admin** role for the mediator | The gateway's user configuration | `curl -u user:pass <gateway>/api/management/v1/subscription-plans` returns 200 |
 | 5 | Generate the webhook secret | `openssl rand -base64 48` | Stored in Key Vault (or your secret store) |
 | 6 | Create the namespace and credentials Secret | [chart README → Credentials](subscription-mediator/deploy/helm/subscription-mediator/README.md#1-credentials) | `kubectl -n $NS get secret subscription-mediator-credentials` |
-| 7 | Write the environment's values file from `examples/values-dev.yaml` | Fill in the gateway URL (`https://…:9093/api/management/v1` for its TLS listener, or `http://…:9090/api/management/v1` for plaintext), the gateway CA (`config.gateway.ca`) when using TLS with a self-signed or private certificate, and the NetworkPolicy namespaces and port | `helm template` renders without errors |
+| 7 | Write the environment's values file from `examples/values-dev.yaml` | Fill in the gateway URL (`http://<release>-gateway-controller.<namespace>.svc:9090/api/management/v1`; the controller has no TLS listener, so `https://…` only for a TLS-terminating proxy or ingress in front of it), the gateway CA (`config.gateway.ca`) when that proxy's certificate is self-signed or from a private CA, and the NetworkPolicy namespaces and port (`9090`) | `helm template` renders without errors |
 | 8 | First install | [§3.3](#33-deploy-to-the-cluster) | Both pods are `Running`, and `helm test` passes |
 | 9 | Register the webhook subscriber in the API Portal | [Register the webhook subscriber](#register-the-webhook-subscriber) below | The subscriber is listed with `enabled: true`, and a test subscription appears on the gateway ([§3.4](#34-verify-end-to-end)) |
 | 10 | Mirror the subscription plans in the portal | [README §8](README.md#8-set-up-the-api-portal) | Plan names match the gateway's |
@@ -193,8 +195,9 @@ msg="listening for API Portal webhooks" address=0.0.0.0:8085 path=/devportal/eve
 ```
 
 Then do a functional check: subscribe to an API in the portal, and confirm the
-subscription appears on the gateway (`GET /subscriptions`) with the portal
-subscription ID as its `referenceId`, and that the portal's delivery history
+subscription appears on the gateway with the portal subscription ID as its
+`id` (`GET /subscriptions/<portal subscription ID>` returns it, with
+`externalRefId` equal to `id`), and that the portal's delivery history
 shows the delivery `DELIVERED`.
 
 ### 3.5 Roll back
@@ -350,13 +353,14 @@ delivery history shows the deliveries `FAILED`.
 
    | Error contains | Cause |
    |---|---|
-   | `x509: certificate signed by unknown authority` | `config.gateway.ca` is not set, or names a different CA |
-   | `x509: certificate is valid for ..., not ...` | the gateway's certificate doesn't name the `baseUrl` host |
-   | `connection refused` | the gateway's TLS listener (`9093`) is not enabled, or the Service doesn't expose it |
+   | `x509: certificate signed by unknown authority` | (TLS proxy only) `config.gateway.ca` is not set, or names a different CA |
+   | `x509: certificate is valid for ..., not ...` | (TLS proxy only) the proxy's certificate doesn't name the `baseUrl` host |
+   | `connection refused` | nothing listens at `baseUrl`: the controller is down, or the Service doesn't expose `9090` (or the proxy's port) |
    | `timeout` / `context deadline exceeded` | blocked on the network: see the next step |
    | `401` | wrong gateway credentials ([§5.2](#52-rotate-the-gateway-credentials)) |
 3. Is it blocked? A timeout with the NetworkPolicy on usually means a wrong
-   `networkPolicy.egress.rules` namespace or port; the port is `9093`.
+   `networkPolicy.egress.rules` namespace or port; the port is `9090` (or the
+   TLS proxy's port, if one is in front).
 4. Is the URL right? Check `config.gateway.baseUrl` against the gateway
    controller Service: `kubectl -n <gateway-ns> get svc`.
 
@@ -372,7 +376,7 @@ why:
 |---|---|
 | `no gateway REST API matches portal API` | Deploy the API to the gateway, or pin it ([§5.1](#51-pin-a-portal-api-to-a-gateway-api)) |
 | `failed to decrypt` / `carries no subscription token` | The webhook secret differs between the portal and the mediator ([§5.3](#53-rotate-the-webhook-secret)) |
-| `the gateway has no subscription with reference ID` | A status or plan change for a subscription the gateway doesn't have; its `subscription.created` delivery was missed. Regenerate the subscription token in the portal: that event creates it |
+| `the gateway has no subscription with ID` | A status or plan change for a subscription the gateway doesn't have; its `subscription.created` delivery was missed. Regenerate the subscription token in the portal: that event creates it. If it happens for every subscription, the gateway controller predates [#3804](https://github.com/wso2/api-platform/pull/3804) and ignored `externalRefId` |
 | Unsupported artifact kind (`Mcp`, `WebSubApi`, …) | The gateway supports subscriptions only on `RestApi`. Nothing to fix |
 | A gateway `4xx` rejection | Read the message. Usually the plan or API state on the gateway; fix it there |
 

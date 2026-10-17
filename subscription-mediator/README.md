@@ -54,8 +54,9 @@ only adds the subscription and credential state the portal owns.
 
 It keeps no state of its own. Each delivery is applied to the gateway before
 the portal gets its answer, and every lookup reads the gateway: a subscription
-by the portal's subscription ID (its `referenceId` on the gateway), an API key
-by the portal's key ID (its `externalRefId`).
+by the portal's subscription ID (which the gateway subscription is created
+under, as its `externalRefId`), an API key by the portal's key ID (its
+`externalRefId`).
 
 ---
 
@@ -75,29 +76,30 @@ openssl rand -base64 48    # paste into [webhook] secret
 secret = "<the generated secret>"
 
 [gateway]
-base_url = "https://host.docker.internal:9093/api/management/v1"
-ca_file = "/app/certs/gateway-ca.crt"
+base_url = "http://host.docker.internal:9090/api/management/v1"
 username = "<gateway-admin-username>"
 password = "<gateway-admin-password>"
 ```
 
 …or leave the file as shipped and put them in a `.env` beside
 `docker-compose.yaml`. Environment variables override the file, compose passes
-these through, and `.env` is git-ignored — so nothing secret is ever staged:
+these through, and `.env` is git-ignored — so nothing secret is ever staged.
+Start from the tracked template, `cp .env.example .env`, and fill it in:
 
 ```bash
 SM_WEBHOOK_SECRET=<the generated secret>
 SM_GATEWAY_USERNAME=<gateway-admin-username>
 SM_GATEWAY_PASSWORD=<gateway-admin-password>
-SM_GATEWAY_BASE_URL=https://host.docker.internal:9093/api/management/v1
-SM_GATEWAY_CA_FILE=/app/certs/gateway-ca.crt
+SM_GATEWAY_BASE_URL=http://host.docker.internal:9090/api/management/v1
 ```
 
-The mediator calls the gateway's management API on its TLS listener, port
-`9093`. When the gateway's certificate is self-signed or from a private CA, copy
-that CA certificate (for a self-signed one, the certificate itself) to
-`certs/gateway-ca.crt` beside `docker-compose.yaml`; compose mounts `certs/` at
-`/app/certs`. Leave `ca_file` out for a certificate from a public CA. See
+The mediator calls the gateway's management API on port `9090`. The gateway
+1.2.0 controller serves it over plain HTTP only; it has no TLS listener of its
+own. When the gateway sits behind a TLS-terminating proxy or ingress, use that
+`https` address instead, and when its certificate is self-signed or from a
+private CA, copy the CA certificate to `certs/gateway-ca.crt` beside
+`docker-compose.yaml` (compose mounts `certs/` at `/app/certs`) and set
+`ca_file = "/app/certs/gateway-ca.crt"`. See
 [Reaching the gateway](#reaching-the-gateway-outbound).
 
 The second way is the better habit, and the one the
@@ -181,8 +183,8 @@ curl -s localhost:8085/status | jq
 Then subscribe to an API in the **API Portal UI** and confirm it landed:
 
 ```bash
-curl -su "<gateway-admin-username>:<gateway-admin-password>" --cacert certs/gateway-ca.crt \
-  https://localhost:9093/api/management/v1/subscriptions | jq
+curl -su "<gateway-admin-username>:<gateway-admin-password>" \
+  http://localhost:9090/api/management/v1/subscriptions | jq
 ```
 
 Subscribing, generating and revoking keys, suspending a subscription and changing
@@ -470,7 +472,7 @@ Everything lives in `configs/config.toml`, mounted read-only at
 secret = ""                 # required
 
 [gateway]
-base_url = "..."            # defaults to https://host.docker.internal:9093/api/management/v1
+base_url = "..."            # defaults to http://host.docker.internal:9090/api/management/v1
 ca_file = ""                # optional: CA bundle for the gateway's TLS certificate
 username = ""               # required
 password = ""               # required
@@ -500,7 +502,7 @@ built-in defaults  ->  configs/config.toml  ->  SM_* environment variables
 | Setting | TOML key | Environment variable | |
 |---|---|---|---|
 | webhook secret | `[webhook] secret` | `SM_WEBHOOK_SECRET` | **required** |
-| gateway address | `[gateway] base_url` | `SM_GATEWAY_BASE_URL` | defaults to `https://host.docker.internal:9093/api/management/v1` |
+| gateway address | `[gateway] base_url` | `SM_GATEWAY_BASE_URL` | defaults to `http://host.docker.internal:9090/api/management/v1` |
 | gateway CA | `[gateway] ca_file` | `SM_GATEWAY_CA_FILE` | optional; a PEM bundle trusted in addition to the system roots |
 | gateway user | `[gateway] username` | `SM_GATEWAY_USERNAME` | **required** |
 | gateway password | `[gateway] password` | `SM_GATEWAY_PASSWORD` | **required** |
@@ -567,7 +569,7 @@ way the other two are deployed.
   API Portal ──────▶ host:8085 ──────▶ subscription-mediator
                                                  │
                                                  ▼
-                                       host:9093 ──TLS─▶ Gateway Controller
+                                       host:9090 ──────▶ Gateway Controller
 ```
 
 ### Reaching the gateway (outbound)
@@ -578,19 +580,19 @@ the mounted config. Its scheme and port pick the gateway listener:
 
 | Listener | Address | `ca_file` |
 |---|---|---|
-| TLS (the default) | `https://<host>:9093/api/management/v1` | the gateway's CA, when self-signed or private |
-| plaintext | `http://<host>:9090/api/management/v1` | leave empty; setting it with an `http` address stops startup |
+| the controller's own (the default) | `http://<host>:9090/api/management/v1` | leave empty; setting it with an `http` address stops startup |
+| a TLS-terminating proxy or ingress in front of it | `https://<proxy-host>[:port]/api/management/v1` | the proxy's CA, when self-signed or private |
 
-The table below gives `<host>` for each layout, written for the TLS listener;
-for the plaintext one, swap in `http` and `9090`.
+The gateway 1.2.0 controller has no TLS listener of its own, so `https` is only
+for a proxy in front of it. The table below gives `<host>` for each layout.
 
 | Gateway runs | `SM_GATEWAY_BASE_URL` |
 |---|---|
-| its own compose stack, Docker Desktop | *(the default)* `https://host.docker.internal:9093/api/management/v1` |
-| its own compose stack, Docker Engine on Linux | `https://172.17.0.1:9093/api/management/v1` |
+| its own compose stack, Docker Desktop | *(the default)* `http://host.docker.internal:9090/api/management/v1` |
+| its own compose stack, Docker Engine on Linux | `http://172.17.0.1:9090/api/management/v1` |
 | on the host machine | same as above — it's the same published port |
-| the mediator itself run outside Docker | `https://localhost:9093/api/management/v1` |
-| Kubernetes, or any remote host | `https://gateway.example.com:9093/api/management/v1` |
+| the mediator itself run outside Docker | `http://localhost:9090/api/management/v1` |
+| Kubernetes | `http://<gateway-controller-service>.<namespace>:9090/api/management/v1` |
 
 `host.docker.internal` is a Docker Desktop name. On Docker Engine for Linux it
 does not exist — use the bridge gateway address `172.17.0.1` rather than adding
@@ -606,13 +608,13 @@ This one deliberately sets no `extra_hosts`, which is why the default above work
 
 #### TLS to the gateway
 
-Port `9093` is the management API's TLS listener; the gateway serves it only
-when `[controller.server.tls]` is enabled with a certificate. The mediator
-verifies that certificate like any HTTPS client, TLS 1.2 or later:
+The gateway 1.2.0 controller serves its management API over plain HTTP only
+(port `9090`); it has no TLS setting for it. For TLS, put a TLS-terminating
+proxy or ingress in front of it and point `base_url` at that `https` address.
+The mediator verifies the proxy's certificate like any HTTPS client, TLS 1.2 or
+later:
 
-- **The certificate must name the host in `base_url`**: `host.docker.internal`
-  for the default, `172.17.0.1` on Docker Engine for Linux, `localhost` when the
-  mediator runs outside Docker.
+- **The certificate must name the host in `base_url`.**
 - **Its issuer must be trusted.** A certificate from a public CA needs nothing
   more. For a self-signed or private-CA certificate, set `[gateway] ca_file` /
   `SM_GATEWAY_CA_FILE` to a PEM bundle of that CA; it is trusted in addition to
@@ -625,7 +627,7 @@ A wrong setup shows at startup, in the gateway reachability check:
 |---|---|
 | `x509: certificate signed by unknown authority` | `ca_file` is not set, or holds a different CA |
 | `x509: certificate is valid for ..., not ...` | the certificate doesn't name the `base_url` host |
-| `connection refused` | the TLS listener is not enabled, or `9093` is not published |
+| `connection refused` | nothing listens on that address and port: the proxy is down, or the port is not published |
 | `gateway.ca_file is set but gateway.base_url ... is not https` | the address still points at plain HTTP |
 | `failed to read the gateway CA file` / `holds no PEM certificate` | the path is wrong, or the file isn't PEM |
 
@@ -654,19 +656,37 @@ needs to reach it.
 
 | API Portal event | Gateway call |
 |---|---|
-| `subscription.created` | `POST /subscriptions` with the portal's own token, and the portal's subscription ID as `referenceId` |
+| `subscription.created` | `POST /subscriptions` with the portal's own token, and the portal's subscription ID as `externalRefId` (it becomes the subscription's `id`) |
 | `subscription.updated` | `PUT /subscriptions/{id}` `{status}` |
 | `subscription.plan_changed` | `PUT /subscriptions/{id}` `{subscriptionPlanId}` — no token needed |
 | `subscription.token_regenerated` | `PUT /subscriptions/{id}` `{subscriptionToken}`; creates the subscription if the gateway has none |
 | `subscription.deleted` | `DELETE /subscriptions/{id}` |
-| `apikey.generated` | `POST /rest-apis/{api}/api-keys`, injecting the portal's key value, with the portal's key ID as `externalRefId` |
+| `apikey.generated` | `POST /rest-apis/{api}/api-keys`, injecting the portal's key value, named `pk-<portal key ID>` and with the portal's key ID as `externalRefId` |
 | `apikey.regenerated` | `PUT /rest-apis/{api}/api-keys/{name}`; creates the key if the gateway has none |
 | `apikey.revoked` | `DELETE /rest-apis/{api}/api-keys/{name}` |
-
-Every `{id}` comes from `GET /subscriptions?referenceId=<portal subscription ID>`,
-and every key `{name}` from `GET /rest-apis/{api}/api-keys`, matched on
-`externalRefId`. Nothing is remembered between events.
 | `application.*`, `apikey.application_updated` | acknowledged, no gateway call — the gateway has no application resource, and the key-to-app link is attribution only |
+
+Every subscription `{id}` is the portal's subscription ID itself: the gateway
+stores the subscription under the `externalRefId` it was created with, so the
+mediator reads it back with `GET /subscriptions/{portal subscription ID}`, where
+a `404` means the gateway has none. Every key `{name}` comes from
+`GET /rest-apis/{api}/api-keys`, matched on the name `pk-<portal key ID>` (or,
+for a key created before that naming, on `externalRefId`). The name is what
+lasts: gateway 1.2.0 clears a key's `externalRefId` when the key is updated, so
+after one regeneration only the name still identifies it. Nothing is remembered
+between events.
+
+**The subscription calls need a gateway controller that includes
+[wso2/api-platform#3804](https://github.com/wso2/api-platform/pull/3804)**
+(issue [#3782](https://github.com/wso2/api-platform/issues/3782)). Stock 1.2.0
+does not; `thivindu/gateway-controller:1.2.0.17-SNAPSHOT` does, and is the base
+controller image of the custom gateway build. That change makes `POST
+/subscriptions` accept an optional `externalRefId` (`^[A-Za-z0-9][A-Za-z0-9._-]*$`,
+1–64 characters) that becomes the subscription's `id`, echoed back as
+`externalRefId`, with a reused one answered `409`; and makes `PUT
+/subscriptions/{id}` a partial update of `status`, `subscriptionPlanId` (`null`
+or `""` clears it) and `subscriptionToken`. It also turns a plan renamed to a
+taken name, or a plan deleted while in use, into a `409` instead of a `500`.
 
 Plans are matched by name against `GET /subscription-plans` and created when
 missing. A gateway API may also carry its own `spec.subscriptionPlans`
@@ -705,13 +725,28 @@ is to regenerate the subscription token in the portal: that event carries
 everything a create needs, so the mediator creates the subscription from it.
 Likewise, an `apikey.regenerated` for a key the gateway doesn't have creates it.
 
-### Name clashes between API keys
+### API key names
 
-A gateway key name is the portal's key handle, slugified (`My Key` → `my-key`).
-Two handles can slugify alike, and a revoked key keeps its name on the gateway,
-so when the name is already taken on that API the start of the portal key ID is
-appended (`my-key-3f9a1c2b`). Rotations and revocations find the key by
-`externalRefId`, never by name, so they always reach the right one.
+A gateway key is named after the portal key ID: `pk-` and the ID, slugified
+(`pk-3f9a1c2b-…`, within the gateway's 63 characters). The portal's key handle
+isn't used: two handles can slugify alike, and the name has to identify the key
+on its own, since the gateway drops a key's `externalRefId` when the key is
+updated. A portal key ID names one key for its whole life, so a `generated`
+event for a key the gateway holds revoked (a late duplicate) is refused rather
+than bringing the credential back.
+
+### API keys don't survive a gateway reconnect to API Manager
+
+With API Manager as its control plane, the gateway controller runs an API key
+sync every time it connects (at startup, and on every reconnect): it fetches
+API Manager's keys and revokes local keys that API Manager doesn't have. The
+keys this mediator injects exist only on the gateway, so each connect revokes
+all of them, and developers' API keys stop working until they regenerate them in
+the portal. Subscriptions aren't affected. The mediator can't put the keys back:
+the portal never stores a key's value. Seen on gateway 1.2.0.12 and
+`thivindu/gateway-controller:1.2.0.17-SNAPSHOT` (log line
+`Starting API key sync at gateway startup`, then `Revoking API key`); it needs a
+gateway-side fix.
 
 ---
 
@@ -770,8 +805,8 @@ This service doesn't retry either. Instead:
   seconds on one delivery.
 - If the portal gives up waiting, the mediator still finishes the job. The
   portal then shows `FAILED` for an event that did apply; repeating it is safe.
-- Repeats converge: a duplicate create finds the subscription by its
-  `referenceId`, the same `PUT` twice changes nothing, a delete of something
+- Repeats converge: a duplicate create gets a `409` and finds the subscription
+  under the portal's subscription ID, the same `PUT` twice changes nothing, a delete of something
   already gone is success, and a regenerate whose generate was lost creates the
   key.
 - Events for one subscription (or one API key) arriving together are applied one
@@ -820,8 +855,8 @@ against the `gateway/v1.2.0` tag. Paths starting with `platform-api/` or
 
 | | This service | Platform API |
 |---|---|---|
-| Identity | **The portal's `subscription_id`**, stored on the gateway subscription as its `referenceId` | **API + `subscriber_id`**, one subscription per pair (`FindByArtifactKindAndSubscriber`). The portal's `subscription_id` isn't used |
-| ID on the gateway | Generated by the gateway, and looked up by `referenceId` | **The Platform API's UUID.** The gateway looks subscriptions up by it |
+| Identity | **The portal's `subscription_id`**, sent as `externalRefId` when the gateway subscription is created | **API + `subscriber_id`**, one subscription per pair (`FindByArtifactKindAndSubscriber`). The portal's `subscription_id` isn't used |
+| ID on the gateway | **The portal's `subscription_id`**: the gateway uses the `externalRefId` as the ID, so `GET /subscriptions/{id}` finds it | **The Platform API's UUID.** The gateway looks subscriptions up by it |
 | Token at rest | **Not kept.** Only the gateway's hash exists | **AES-256-GCM encrypted**, with a hash for lookups (`platform-api/internal/repository/subscription_repository.go`) |
 | `created` | `POST /subscriptions` with the portal's token | Saved with the portal's token, then `subscription.created` is sent to every gateway the API is deployed on |
 | `updated` (status) | `PUT /subscriptions/{id}` `{status}` | Database update, then `subscription.updated` with the full record |
@@ -833,8 +868,8 @@ against the `gateway/v1.2.0` tag. Paths starting with `platform-api/` or
 
 | | This service | Platform API |
 |---|---|---|
-| Gateway key name | The handle, slugified, with a key-ID suffix when the name is taken. Found later by `externalRefId` | The handle as-is; keys are unique by artifact + name |
-| Duplicate generate | Finds the key by `externalRefId` and sets the same value again | A unique-constraint violation counts as success |
+| Gateway key name | `pk-<portal key ID>`. Found later by that name | The handle as-is; keys are unique by artifact + name |
+| Duplicate generate | Finds the key by name and sets the same value again | A unique-constraint violation counts as success |
 | `apikey.application_updated` | **Ignored** (logged and acknowledged) | Handled |
 | `application.*` | Ignored. The gateway has no application resource | Handled |
 
@@ -860,7 +895,7 @@ against the `gateway/v1.2.0` tag. Paths starting with `platform-api/` or
 1. **Who owns the gateway's state.** The Platform API is the gateway's control
    plane: it picks the IDs, pushes full records, and the gateway resyncs from
    it. This service is an outside client of a gateway API Manager owns, hence
-   the reference IDs and the name-based API matching.
+   the caller-chosen subscription IDs and the name-based API matching.
 2. **Where failures are absorbed.** Both handle the event in the request. The
    Platform API's own write always succeeds and the gateway resyncs from it
    later; this service reports a gateway failure straight back to the portal,
@@ -876,6 +911,7 @@ against the `gateway/v1.2.0` tag. Paths starting with `platform-api/` or
 
 ```
 Dockerfile                   build context is THIS directory
+.env.example                 template for the git-ignored .env (SM_* overrides)
 .dockerignore                keeps .env and configs/ out of it
 docker-compose.yaml          how it runs
 configs/config.toml          all configuration; mounted read-only
@@ -887,7 +923,7 @@ cmd/subscription-mediator/   startup and wiring
 internal/config/             file + env loading, validation, fixed constants
 internal/webhook/            envelope, HMAC verification, AES-256-GCM decryption
 internal/gateway/            management REST API client
-internal/mediator/           event translation, lookups by reference ID
+internal/mediator/           event translation, lookups by portal ID
 internal/server/             HTTP endpoints
 ```
 

@@ -15,12 +15,16 @@ image:
 
 config:
   gateway:
-    baseUrl: https://<gateway-release>-gateway-controller.<gateway-namespace>.svc:9093/api/management/v1
-    # The CA that issued the gateway's TLS certificate, copied into this
-    # namespace (e.g. by cert-manager or trust-manager).
-    ca:
-      secretName: <gateway-ca-secret>
-      key: ca.crt
+    # The controller serves its management API over plain HTTP on 9090; it has
+    # no TLS listener of its own.
+    baseUrl: http://<gateway-release>-gateway-controller.<gateway-namespace>.svc:9090/api/management/v1
+    # Only when baseUrl is an https address of a TLS-terminating proxy or
+    # ingress in front of the controller, with a self-signed or private-CA
+    # certificate: the CA, copied into this namespace (e.g. by cert-manager or
+    # trust-manager). Setting it with an http baseUrl stops startup.
+    # ca:
+    #   secretName: <gateway-ca-secret>
+    #   key: ca.crt
   logging:
     level: info
   apiHandles: {}
@@ -49,5 +53,5 @@ networkPolicy:
               matchLabels:
                 kubernetes.io/metadata.name: <gateway-namespace>
         ports:
-          - port: 9093
+          - port: 9090
             protocol: TCP

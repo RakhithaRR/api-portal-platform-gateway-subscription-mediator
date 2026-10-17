@@ -22,16 +22,25 @@ API Portal 1.0.0
 ([docs](https://wso2.com/api-platform/docs/api-portal/1.0.0/overview/) ·
 [`api-portal/v1.0.0`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0)).
 
-> **The gateway must carry the subscription API change from
-> [wso2/api-platform#3782](https://github.com/wso2/api-platform/issues/3782)**,
-> which stock 1.2.0 does not have: `POST /subscriptions` accepting `referenceId`,
-> `GET /subscriptions?referenceId=`, and a partial `PUT /subscriptions/{id}` that
-> also takes `subscriptionPlanId` (`null` clears it) and `subscriptionToken`. The
-> mediator finds every subscription by that reference ID and changes plans and
-> tokens in place. Against a stock 1.2.0 gateway, which ignores `referenceId`,
-> Phases 6–9 do not behave as written — status and plan changes answer `422`
-> because no subscription carries the reference, and a token regeneration
-> creates a second subscription. That is a missing prerequisite, not a finding.
+> **The gateway controller must include
+> [wso2/api-platform#3804](https://github.com/wso2/api-platform/pull/3804)**
+> (issue [#3782](https://github.com/wso2/api-platform/issues/3782)), which stock
+> 1.2.0 does not; `thivindu/gateway-controller:1.2.0.17-SNAPSHOT` does, and is
+> the base controller image of the custom gateway build. With it, `POST
+> /subscriptions` accepts an optional `externalRefId`
+> (`^[A-Za-z0-9][A-Za-z0-9._-]*$`, 1–64 characters) that becomes the
+> subscription's `id` (responses carry `externalRefId` equal to `id`; a reused
+> one is `409`), and `PUT /subscriptions/{id}` is a partial update of `status`,
+> `subscriptionPlanId` (`null` or `""` clears it) and `subscriptionToken`. It
+> also makes renaming a plan to a taken name, or deleting a plan in use, `409`
+> instead of `500`. The mediator creates each gateway subscription with the
+> portal's subscription id as `externalRefId`, finds it with
+> `GET /subscriptions/{portal subscription id}` (`404` = none), and changes
+> plans and tokens in place. Against a stock 1.2.0 gateway, which ignores
+> `externalRefId` and generates its own ids, Phases 6–9 do not behave as
+> written — status and plan changes answer `422` because no subscription has
+> the portal's id, and a token regeneration creates a second subscription. That
+> is a missing prerequisite, not a finding.
 
 The portal endpoints used below are specified in the API Portal
 [Management REST API reference](https://wso2.com/api-platform/docs/api-portal/1.0.0/overview/)
@@ -48,15 +57,15 @@ Each portal action's webhook is described in the
 | Input | Notes |
 |---|---|
 | `wso2am-4.7.0` pack, unpacked | not started, default config is fine |
-| `wso2apip-api-gateway-1.2.0.zip` | [`gateway/v1.2.0`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0), **built with the subscription API change** in [#3782](https://github.com/wso2/api-platform/issues/3782) — see above |
+| `wso2apip-api-gateway-1.2.0.zip` | [`gateway/v1.2.0`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0), **with a gateway controller that includes** [#3804](https://github.com/wso2/api-platform/pull/3804) (e.g. `thivindu/gateway-controller:1.2.0.17-SNAPSHOT`) — see above |
 | `wso2apip-api-portal-1.0.0.zip` | [`api-portal/v1.0.0`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0) |
 | This repository | the `resources/` and `subscription-mediator/` directories |
 | JDK 21+ | API Manager 4.7.0 passes `--enable-native-access=ALL-UNNAMED`; **JDK 11 refuses to start** with `Could not create the Java Virtual Machine` |
 | Docker with Compose v2 | Desktop or Engine |
 | `curl`, `jq`, `openssl`, `unzip` | |
 
-Ports used: `9444` (API Manager, offset 1), `9090`/`9093`/`8443` (gateway
-management, plaintext and TLS / ingress), `9543`/`9243` (portal / platform API), `8085` (mediator). All must be
+Ports used: `9444` (API Manager, offset 1), `9090`/`8443` (gateway
+management / ingress), `9543`/`9243` (portal / platform API), `8085` (mediator). All must be
 free.
 
 ## How to run this
@@ -288,43 +297,9 @@ EOF
 `api-platform.env` now holds a registration token and an OAuth2 client secret.
 It is specific to this machine — never commit it.
 
-The mediator calls the management API on its **TLS listener** (`9093`), which
-serves the same API as the plaintext one on `9090`, is off by default and has no
-certificate. Give it a self-signed one whose names cover every host the mediator
-may use — `host.docker.internal` on Docker Desktop, `$HOST_ADDR` on Docker
-Engine (`172.17.0.1`):
-
-```bash
-mkdir -p gateway-controller/listener-certs
-openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -subj "/CN=gateway-management" \
-  -addext "subjectAltName=DNS:host.docker.internal,DNS:localhost,IP:127.0.0.1,IP:$HOST_ADDR" \
-  -keyout gateway-controller/listener-certs/mgmt-api.key \
-  -out gateway-controller/listener-certs/mgmt-api.crt
-```
-
-`gateway-controller/listener-certs/` is mounted read-only into the controller at
-`/app/listener-certs`. The listener is configured only in `configs/config.toml`
-— these keys have no environment-variable form:
-
-```bash
-if grep -q '^\[controller\.server\.tls\]' configs/config.toml; then
-  echo "EDIT: set enabled, port, cert_path, key_path in the existing [controller.server.tls] block"
-else
-  cat >> configs/config.toml <<'EOF'
-
-[controller.server.tls]
-enabled = true
-port = 9093
-cert_path = "/app/listener-certs/mgmt-api.crt"
-key_path = "/app/listener-certs/mgmt-api.key"
-EOF
-fi
-grep -q '"9093:9093"' docker-compose.yaml || echo 'EDIT: add - "9093:9093" under gateway-controller ports'
-```
-
-Act on any `EDIT:` line it prints — the block's values are the four shown in
-the heredoc — then start:
+The controller serves the management API over plain HTTP on `9090` only — it
+has no TLS listener, and a `[controller.server.tls]` block is ignored — so the
+mediator uses `9090` too. Start:
 
 ```bash
 docker compose up -d
@@ -337,20 +312,10 @@ docker compose logs gateway-controller | grep -i "control plane connection"
 
 curl -s -o /dev/null -w "gw mgmt %{http_code}\n" -u "$GW_USER:$GW_PASS" "$GW_MGMT/rest-apis"
 # gw mgmt 200
-
-curl -s -o /dev/null -w "gw mgmt tls %{http_code}\n" -u "$GW_USER:$GW_PASS" \
-  --cacert gateway-controller/listener-certs/mgmt-api.crt \
-  https://localhost:9093/api/management/v1/subscription-plans
-# gw mgmt tls 200
 ```
 
 **Expected:** `Control plane connection established`, and `200` from the
-management API on both listeners. `000` from the TLS check means the listener
-isn't up: `connection refused` is the block not enabled or `9093` not published;
-a certificate error is the `cert_path`/`key_path` pair; if the controller log
-says it cannot read the key, check the file's permissions against the
-container's user. The rest of this document keeps calling the plaintext
-`$GW_MGMT`; only the mediator uses `9093`. `dial tcp 172.17.0.1:9444: connection refused` means
+management API. `dial tcp 172.17.0.1:9444: connection refused` means
 `APIP_GW_CONTROLLER_CONTROLPLANE_HOST` resolved through
 `host.docker.internal` — go back to S1 and use the LAN address.
 
@@ -407,19 +372,17 @@ The webhook secret does double duty: it signs each delivery *and* derives the
 key that encrypts the subscription token and API key inside it. The portal and
 the mediator must hold the same one.
 
-The gateway's management certificate from S5 is self-signed, so it is its own
-CA. The mediator's compose mounts `certs/` read-only at `/app/certs`.
+The `.env` below has the same keys as the tracked `.env.example`; it is
+written from the variables rather than copied, so the run stays unattended.
 
 ```bash
 export WEBHOOK_SECRET=$(openssl rand -base64 48 | tr -d '\n')
 cd "$DEMO/subscription-mediator"
-cp "$GW_DIR/gateway-controller/listener-certs/mgmt-api.crt" certs/gateway-ca.crt
 cat > .env <<EOF
 SM_WEBHOOK_SECRET=$WEBHOOK_SECRET
 SM_GATEWAY_USERNAME=$GW_USER
 SM_GATEWAY_PASSWORD=$GW_PASS
-SM_GATEWAY_BASE_URL=https://host.docker.internal:9093/api/management/v1
-SM_GATEWAY_CA_FILE=/app/certs/gateway-ca.crt
+SM_GATEWAY_BASE_URL=http://host.docker.internal:9090/api/management/v1
 EOF
 
 make build
@@ -436,22 +399,17 @@ msg="subscription-mediator is ready"
 ```
 
 A `could not reach the gateway management API` warning instead of the first
-line is a finding about the TLS setup; its error says which:
-`x509: certificate signed by unknown authority` is `SM_GATEWAY_CA_FILE` unset or
-pointing at another certificate; `x509: certificate is valid for ..., not ...`
-is a host in `SM_GATEWAY_BASE_URL` the certificate doesn't name;
-`connection refused` is the `9093` listener off or unpublished. A container that
-exits instead names a bad CA setting in its last log line — `ca_file is set but
-gateway.base_url ... is not https`, `failed to read the gateway CA file`, or
-`holds no PEM certificate`.
+line is a finding; its error says why — `connection refused` is nothing
+answering at `SM_GATEWAY_BASE_URL` (the gateway down, `9090` unpublished, or
+the wrong host for this Docker), `401` is the credentials. A container that
+exits instead names the missing or invalid setting in its last log line.
 
 The mediator keeps no state: there is no volume to clear between runs. Every
 lookup reads the gateway, so a gateway left with subscriptions or keys from an
 earlier run is what a clean run has to avoid, not the mediator.
 
-On Docker Engine for Linux use `https://172.17.0.1:9093/...` for
-`SM_GATEWAY_BASE_URL` — `host.docker.internal` is a Docker Desktop name. The
-certificate covers it because `$HOST_ADDR` is `172.17.0.1` there.
+On Docker Engine for Linux use `http://172.17.0.1:9090/...` for
+`SM_GATEWAY_BASE_URL` — `host.docker.internal` is a Docker Desktop name.
 
 ## S9 — Portal: webhook subscriber, plans, APIs
 
@@ -632,6 +590,16 @@ curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/rest-apis/reading-list-api-v1/api-keys"
 
 **Expected:** one subscription, and the key appears as `verify-rl` — the
 portal's `verify_rl` **slugified**, underscores to hyphens.
+
+```bash
+curl -s -u "$GW_USER:$GW_PASS" "$GW_MGMT/subscriptions/$SUB" | jq -c '{id, externalRefId, status}'
+# {"id":"<$SUB>","externalRefId":"<$SUB>","status":"ACTIVE"}
+```
+
+**Expected:** the gateway subscription's `id` and `externalRefId` are both the
+portal's subscription id. A `404`, or an `id` that differs, means the gateway
+controller predates [#3804](https://github.com/wso2/api-platform/pull/3804) —
+a missing prerequisite, not a finding.
 
 ```bash
 curl -sk -o /dev/null -w "%{http_code}\n" "$GW_URL/reading-list/books" \
@@ -818,9 +786,9 @@ printf "new token : "; curl -sk -o /dev/null -w "%{http_code}\n" "$GW_URL/readin
 ```
 
 **Expected:** old token rejected, new one accepted, **API key unchanged**. The
-mediator replaces the token on the existing gateway subscription — found by its
-`referenceId`, the portal's subscription id — so the gateway subscription id
-does not change:
+mediator replaces the token on the existing gateway subscription — whose id
+is the portal's subscription id — so the gateway subscription id does not
+change:
 
 ```
 msg="replaced the gateway subscription's token" event_type=subscription.token_regenerated gateway_subscription_id=<same as before>

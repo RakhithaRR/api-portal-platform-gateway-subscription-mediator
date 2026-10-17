@@ -26,7 +26,7 @@ func (m *Mediator) handleSubscriptionCreated(ctx context.Context, env *webhook.E
 }
 
 // createSubscription creates the gateway subscription for a portal one, under
-// the portal's subscription ID as its reference ID.
+// the portal's subscription ID as its ID (externalRefId).
 func (m *Mediator) createSubscription(ctx context.Context, data *webhook.SubscriptionData, token string, log *slog.Logger) error {
 	resolved, err := m.resolver.resolveAPI(ctx, &data.API)
 	if err != nil {
@@ -51,7 +51,7 @@ func (m *Mediator) createSubscription(ctx context.Context, data *webhook.Subscri
 	}
 
 	req := &gateway.SubscriptionCreateRequest{
-		ReferenceID:        data.SubscriptionID,
+		ExternalRefID:      data.SubscriptionID,
 		APIID:              resolved.handle,
 		SubscriptionToken:  token,
 		ApplicationID:      strings.TrimSpace(data.ApplicationID),
@@ -110,20 +110,20 @@ func (m *Mediator) recoverCreate(
 	}
 
 	// A duplicate delivery, or a create whose response was lost after the
-	// gateway committed it. The reference ID says whether it is ours.
+	// gateway committed it. A subscription under the portal's ID says it is ours.
 	if apiErr.IsConflict() {
-		existing, findErr := m.client.FindSubscription(ctx, req.ReferenceID)
+		existing, findErr := m.client.FindSubscription(ctx, req.ExternalRefID)
 		if findErr != nil {
 			return nil, fmt.Errorf("the gateway reported the subscription exists but looking it up failed: %w", findErr)
 		}
 		if existing != nil {
 			log.Info("the gateway already has this subscription; nothing to do",
-				slog.String("portal_subscription_id", req.ReferenceID),
+				slog.String("portal_subscription_id", req.ExternalRefID),
 				slog.String("gateway_subscription_id", existing.ID))
 			return nil, nil
 		}
 		return nil, permanentf("the gateway rejected the subscription create as a conflict, and holds no "+
-			"subscription with reference ID %q: %s", req.ReferenceID, apiErr.Message)
+			"subscription with ID %q: %s", req.ExternalRefID, apiErr.Message)
 	}
 
 	if apiErr.IsNotFound() {
@@ -324,8 +324,8 @@ func decodeSubscriptionData(env *webhook.Envelope) (*webhook.SubscriptionData, e
 	return &data, nil
 }
 
-// findSubscription looks a portal subscription up on the gateway by its
-// reference ID, returning nil when the gateway has none.
+// findSubscription looks a portal subscription up on the gateway by its ID,
+// which is the portal's subscription ID, returning nil when the gateway has none.
 func (m *Mediator) findSubscription(ctx context.Context, portalSubscriptionID string) (*gateway.Subscription, error) {
 	sub, err := m.client.FindSubscription(ctx, portalSubscriptionID)
 	if err != nil {
@@ -345,7 +345,7 @@ func (m *Mediator) requireSubscription(ctx context.Context, data *webhook.Subscr
 		return nil, err
 	}
 	if sub == nil {
-		return nil, permanentf("cannot apply %s: the gateway has no subscription with reference ID %q. Its "+
+		return nil, permanentf("cannot apply %s: the gateway has no subscription with ID %q. Its "+
 			"subscription.created delivery was probably missed (the API Portal does not redeliver). Have the "+
 			"developer regenerate the subscription token, which sends an event this mediator can create it from",
 			eventType, data.SubscriptionID)

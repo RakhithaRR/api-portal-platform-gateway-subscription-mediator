@@ -4,7 +4,7 @@
 // Each event is applied to the gateway while the portal's delivery waits, and
 // the HTTP layer answers with the outcome. Nothing is stored: every lookup
 // reads the gateway. A subscription is found by the portal's subscription ID,
-// carried on the gateway subscription as its reference ID, and an API key by
+// which the gateway subscription is created under (its externalRefId), and an API key by
 // the portal's key ID, carried as its externalRefId.
 //
 // The API Portal attempts each delivery exactly once, with no retry. A failure
