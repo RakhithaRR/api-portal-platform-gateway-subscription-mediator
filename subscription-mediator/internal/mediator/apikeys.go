@@ -53,10 +53,13 @@ func (m *Mediator) putAPIKey(ctx context.Context, env *webhook.Envelope, log *sl
 		return err
 	}
 
-	req := &gateway.APIKeyRequest{APIKey: secret, ExternalRefID: data.KeyID}
-	if expiresAt, ok := data.ExpiresAtTime(); ok {
-		req.ExpiresAt = &expiresAt
+	// An expiry the mediator cannot read is reported, not dropped: a key injected
+	// without one would outlive what the developer was shown in the portal.
+	expiresAt, err := data.ExpiresAtTime()
+	if err != nil {
+		return permanentf("the key's expiry cannot be applied: %v", err)
 	}
+	req := &gateway.APIKeyRequest{APIKey: secret, ExternalRefID: data.KeyID, ExpiresAt: expiresAt}
 
 	var key *gateway.APIKey
 	if existing := liveKeyFor(keys, data.KeyID); existing != nil {

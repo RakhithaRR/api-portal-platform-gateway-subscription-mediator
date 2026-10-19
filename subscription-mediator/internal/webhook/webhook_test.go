@@ -190,11 +190,19 @@ func TestPlanRefDisplayAcceptsBothProducerFieldNames(t *testing.T) {
 
 func TestAPIKeyDataExpiresAt(t *testing.T) {
 	iso := "2027-01-01T00:00:00Z"
-	got, ok := (&APIKeyData{ExpiresAt: &iso}).ExpiresAtTime()
-	if !ok || !got.Equal(time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)) {
-		t.Fatalf("ExpiresAtTime() = %v, %v", got, ok)
+	got, err := (&APIKeyData{ExpiresAt: &iso}).ExpiresAtTime()
+	if err != nil || got == nil || !got.Equal(time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("ExpiresAtTime() = %v, %v", got, err)
 	}
-	if _, ok := (&APIKeyData{}).ExpiresAtTime(); ok {
-		t.Fatal("ExpiresAtTime() on a non-expiring key = ok, want not ok")
+	for name, raw := range map[string]*string{"null": nil, "empty": new(string)} {
+		got, err := (&APIKeyData{ExpiresAt: raw}).ExpiresAtTime()
+		if err != nil || got != nil {
+			t.Errorf("ExpiresAtTime() on a non-expiring key (%s) = %v, %v; want nil, nil", name, got, err)
+		}
+	}
+	// A value that is present but unreadable must not pass as "never expires".
+	bad := "01/01/2027"
+	if got, err := (&APIKeyData{ExpiresAt: &bad}).ExpiresAtTime(); err == nil {
+		t.Fatalf("ExpiresAtTime() on %q = %v, nil; want an error", bad, got)
 	}
 }

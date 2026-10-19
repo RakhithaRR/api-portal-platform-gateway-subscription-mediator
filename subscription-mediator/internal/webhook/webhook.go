@@ -127,17 +127,21 @@ type APIKeyData struct {
 	Key         *EncryptedField `json:"key"`
 }
 
-// ExpiresAtTime parses expires_at, which is null for a non-expiring key.
-func (d *APIKeyData) ExpiresAtTime() (time.Time, bool) {
+// ExpiresAtTime parses expires_at. A nil result with a nil error is a
+// non-expiring key (the field is null or absent). A value that is present but
+// not an RFC 3339 timestamp is an error: treating it as "no expiry" would inject
+// a key that never expires where the portal meant one that does.
+func (d *APIKeyData) ExpiresAtTime() (*time.Time, error) {
 	if d.ExpiresAt == nil || strings.TrimSpace(*d.ExpiresAt) == "" {
-		return time.Time{}, false
+		return nil, nil
 	}
+	raw := strings.TrimSpace(*d.ExpiresAt)
 	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
-		if t, err := time.Parse(layout, *d.ExpiresAt); err == nil {
-			return t, true
+		if t, err := time.Parse(layout, raw); err == nil {
+			return &t, nil
 		}
 	}
-	return time.Time{}, false
+	return nil, fmt.Errorf("expires_at %q is not an RFC 3339 timestamp", raw)
 }
 
 // Decode parses a raw request body into an Envelope and checks the fields the

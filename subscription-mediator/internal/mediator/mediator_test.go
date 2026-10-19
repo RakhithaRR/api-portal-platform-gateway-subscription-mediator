@@ -1137,6 +1137,28 @@ func TestShortAPIKeyIsRejectedRatherThanAltered(t *testing.T) {
 	}
 }
 
+// TestUnreadableExpiryIsRejectedRatherThanDropped: an expires_at the mediator
+// cannot parse must not turn into a key that never expires.
+func TestUnreadableExpiryIsRejectedRatherThanDropped(t *testing.T) {
+	fake := newFakeGateway()
+	fake.addAPI("Order API", "v1.0", "order-api-v1.0")
+	h := newHarness(t, fake, nil)
+
+	const secret = "apip_a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00"
+	data := map[string]any{"key_id": "portal-key-1", "handle": "expiring-key", "api": apiRef(),
+		"expires_at": "01/01/2027", "key": encryptField(t, secret)}
+	err := h.handle(t, buildEvent(t, "evt-1", webhook.EventAPIKeyGenerated, data, "key"))
+	if !IsPermanent(err) {
+		t.Fatalf("Handle() with an unreadable expires_at = %v, want a permanent failure", err)
+	}
+	if !strings.Contains(err.Error(), "expires_at") {
+		t.Errorf("the error does not name the field at fault: %v", err)
+	}
+	if fake.keyCount() != 0 {
+		t.Error("a key was injected without the expiry the portal gave it")
+	}
+}
+
 // --- other events and helpers -----------------------------------------------
 
 func TestApplicationEventIsAcknowledgedWithoutAGatewayCall(t *testing.T) {
