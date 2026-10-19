@@ -59,7 +59,7 @@ Each portal action's webhook is described in the
 | `wso2am-4.7.0` pack, unpacked | not started, default config is fine |
 | `wso2apip-api-gateway-1.2.0.zip` | [`gateway/v1.2.0`](https://github.com/wso2/api-platform/releases/tag/gateway%2Fv1.2.0), **with a gateway controller that includes** [#3804](https://github.com/wso2/api-platform/pull/3804) (e.g. `thivindu/gateway-controller:1.2.0.17-SNAPSHOT`) — see above |
 | `wso2apip-api-portal-1.0.0.zip` | [`api-portal/v1.0.0`](https://github.com/wso2/api-platform/releases/tag/api-portal%2Fv1.0.0) |
-| This repository | the `resources/` and `subscription-mediator/` directories |
+| This repository | the `resources/` and `src/` directories |
 | JDK 21+ | API Manager 4.7.0 passes `--enable-native-access=ALL-UNNAMED`; **JDK 11 refuses to start** with `Could not create the Java Virtual Machine` |
 | Docker with Compose v2 | Desktop or Engine |
 | `curl`, `jq`, `openssl`, `unzip` | |
@@ -377,7 +377,7 @@ written from the variables rather than copied, so the run stays unattended.
 
 ```bash
 export WEBHOOK_SECRET=$(openssl rand -base64 48 | tr -d '\n')
-cd "$DEMO/subscription-mediator"
+cd "$DEMO/src"
 cat > .env <<EOF
 SM_WEBHOOK_SECRET=$WEBHOOK_SECRET
 SM_GATEWAY_USERNAME=$GW_USER
@@ -1180,7 +1180,7 @@ curl -sk -X POST "$PORTAL/apis/echo-api-v1/api-keys/generate" \
 sleep 15
 curl -s localhost:8085/status | jq -c .events
 # {"applied":17,"failed":1}
-cd "$DEMO/subscription-mediator" && docker compose logs | grep "event apply failed at the gateway" | tail -1
+cd "$DEMO/src" && docker compose logs | grep "event apply failed at the gateway" | tail -1
 ```
 
 **Expected:** `failed` rises to `1` and `applied` stays `17`; the mediator log
@@ -1271,7 +1271,7 @@ the assertion once, a few seconds later. A real failure repeats.
 ## Teardown
 
 ```bash
-cd "$DEMO/subscription-mediator" && docker compose down
+cd "$DEMO/src" && docker compose down
 cd "$GW_DIR"     && docker compose down
 cd "$PORTAL_DIR" && docker compose down
 cd "$APIM_PACK"  && ./bin/api-manager.sh --stop                # or kill the process

@@ -19,7 +19,7 @@ The commands below assume:
 ```bash
 NS=subscription-mediator
 RELEASE=subscription-mediator
-CHART=subscription-mediator/deploy/helm/subscription-mediator
+CHART=src/deploy/helm/subscription-mediator
 DEV_REGISTRY=<artifactory host>/<docker repo key>[/<path>]   # no scheme, e.g. mycompany.jfrog.io/docker-dev/api-platform
 JFROG_URL=https://<artifactory host>                     # e.g. https://mycompany.jfrog.io
 PODS="app.kubernetes.io/name=subscription-mediator,app.kubernetes.io/instance=$RELEASE"
@@ -70,12 +70,12 @@ instructions.
 
 | # | Step | Detail | Done when |
 |---|---|---|---|
-| 1 | In Artifactory: pick the local Docker repository, create the CI user with Read, Annotate, Deploy/Cache and Delete/Overwrite on it, and add the GitHub OIDC integration with an identity mapping for this repository's `dev` environment | [mediator README → Publishing the image, step 1](subscription-mediator/README.md#1-artifactory-the-repository-the-ci-user-and-oidc) | The integration lists a mapping with claims `{"repository": "<owner>/<repo>", "environment": "dev"}` scoped to the CI user |
-| 2 | Create the GitHub `dev` environment: limit it to the `main` branch, and set `DEV_REGISTRY`, `JFROG_URL` and `JFROG_OIDC_PROVIDER` (or `JFROG_USERNAME` and the `JFROG_ACCESS_TOKEN` secret) | [step 2](subscription-mediator/README.md#2-github-the-dev-environment) | A manual run of the workflow pushes an image ([§3.2](#32-confirm-the-image-was-published)) |
+| 1 | In Artifactory: pick the local Docker repository, create the CI user with Read, Annotate, Deploy/Cache and Delete/Overwrite on it, and add the GitHub OIDC integration with an identity mapping for this repository's `dev` environment | [mediator README → Publishing the image, step 1](src/README.md#1-artifactory-the-repository-the-ci-user-and-oidc) | The integration lists a mapping with claims `{"repository": "<owner>/<repo>", "environment": "dev"}` scoped to the CI user |
+| 2 | Create the GitHub `dev` environment: limit it to the `main` branch, and set `DEV_REGISTRY`, `JFROG_URL` and `JFROG_OIDC_PROVIDER` (or `JFROG_USERNAME` and the `JFROG_ACCESS_TOKEN` secret) | [step 2](src/README.md#2-github-the-dev-environment) | A manual run of the workflow pushes an image ([§3.2](#32-confirm-the-image-was-published)) |
 | 3 | Let AKS pull from Artifactory: a pull-only user or token (Read on the repository) and an image pull secret, referenced from the values file as `imagePullSecrets: [{name: artifactory-pull}]` | `kubectl -n $NS create secret docker-registry artifactory-pull --docker-server=<artifactory host> --docker-username=<user> --docker-password=<token>` | `kubectl -n $NS get secret artifactory-pull` |
 | 4 | Create a gateway user with the **admin** role for the mediator | The gateway's user configuration | `curl -u user:pass <gateway>/api/management/v1/subscription-plans` returns 200 |
 | 5 | Generate the webhook secret | `openssl rand -base64 48` | Stored in Key Vault (or your secret store) |
-| 6 | Create the namespace and credentials Secret | [chart README → Credentials](subscription-mediator/deploy/helm/subscription-mediator/README.md#1-credentials) | `kubectl -n $NS get secret subscription-mediator-credentials` |
+| 6 | Create the namespace and credentials Secret | [chart README → Credentials](src/deploy/helm/subscription-mediator/README.md#1-credentials) | `kubectl -n $NS get secret subscription-mediator-credentials` |
 | 7 | Write the environment's values file from `examples/values-dev.yaml` | Fill in the gateway URL (`http://<release>-gateway-controller.<namespace>.svc:9090/api/management/v1`; the controller has no TLS listener, so `https://…` only for a TLS-terminating proxy or ingress in front of it), the gateway CA (`config.gateway.ca`) when that proxy's certificate is self-signed or from a private CA, and the NetworkPolicy namespaces and port (`9090`) | `helm template` renders without errors |
 | 8 | First install | [§3.3](#33-deploy-to-the-cluster) | Both pods are `Running`, and `helm test` passes |
 | 9 | Register the webhook subscriber in the API Portal | [Register the webhook subscriber](#register-the-webhook-subscriber) below | The subscriber is listed with `enabled: true`, and a test subscription appears on the gateway ([§3.4](#34-verify-end-to-end)) |
@@ -137,7 +137,7 @@ mediator verifies every delivery against its one webhook secret.
 
 ### 3.1 Build and publish (automatic)
 
-1. Open a PR that changes `subscription-mediator/**`. CI runs `go mod tidy`,
+1. Open a PR that changes `src/**`. CI runs `go mod tidy`,
    `go vet`, `go test -race`, `govulncheck`, and a multi-arch build that it
    does not push. **All must pass before merge.**
 2. Merge to `main`. The workflow **subscription-mediator (dev)** checks
@@ -146,7 +146,7 @@ mediator verifies every delivery against its one webhook secret.
    with its digest.
 
 If CI fails, use the table in
-[mediator README → When it fails](subscription-mediator/README.md#when-it-fails).
+[mediator README → When it fails](src/README.md#when-it-fails).
 
 ### 3.2 Confirm the image was published
 
@@ -453,7 +453,7 @@ helm -n $NS list
 
 | Need | Where |
 |---|---|
-| How the mediator works, its config, endpoints and delivery semantics | [subscription-mediator/README.md](subscription-mediator/README.md) |
-| CI and Artifactory setup, and CI failures | [README → Publishing the image](subscription-mediator/README.md#publishing-the-image) |
-| Chart values and design | [deploy/helm/subscription-mediator/README.md](subscription-mediator/deploy/helm/subscription-mediator/README.md) |
+| How the mediator works, its config, endpoints and delivery semantics | [src/README.md](src/README.md) |
+| CI and Artifactory setup, and CI failures | [README → Publishing the image](src/README.md#publishing-the-image) |
+| Chart values and design | [deploy/helm/subscription-mediator/README.md](src/deploy/helm/subscription-mediator/README.md) |
 | The full demo flow (gateway, APIM, portal) | [README.md](README.md) |

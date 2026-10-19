@@ -70,7 +70,7 @@ RUNBOOK.md                  operating it in dev: release, deploy, rotate,
                             monitor, and the incident playbooks
 agent-verification.md       an end-to-end test script for a coding agent —
                             every subscription and API-key operation, asserted
-subscription-mediator/      the bridge itself — Go, runs in Docker
+src/                        the bridge itself — Go, runs in Docker
                             (see its own README for internals and operations)
 .github/workflows/          CI: tests the mediator and publishes its image to
                             the dev Docker repository in JFrog Artifactory (setup: the
@@ -458,7 +458,7 @@ the tracked template with the same keys — `cp .env.example .env` and fill it i
 by hand if you prefer — or write it from the variables above:
 
 ```bash
-cd subscription-mediator
+cd src
 cat > .env <<EOF
 SM_WEBHOOK_SECRET=$WEBHOOK_SECRET
 SM_GATEWAY_USERNAME=$GW_USER
@@ -483,7 +483,7 @@ msg="listening for API Portal webhooks" address=0.0.0.0:8085 path=/devportal/eve
 `http://172.17.0.1:9090/...` instead — `host.docker.internal` is a Docker
 Desktop name. For TLS, put a TLS-terminating proxy or ingress in front of the
 controller and use its `https` address (plus `SM_GATEWAY_CA_FILE` for a private
-CA). The mediator's [README](subscription-mediator/README.md) has the full
+CA). The mediator's [README](src/README.md) has the full
 matrix, including running the portal or gateway outside Docker or in
 Kubernetes.
 
@@ -839,7 +839,7 @@ build's ports, `scripts/setup.sh` flags and `configs/config-template.toml`.
   API-key endpoints reject every other kind.
 - Full operational detail — configuration precedence, networking matrix,
   per-event behaviour, failure handling — is in
-  [`subscription-mediator/README.md`](subscription-mediator/README.md).
+  [`src/README.md`](src/README.md).
 - [`agent-verification.md`](agent-verification.md) drives the same flow entirely
   over REST, with expected results for every subscription and API-key operation
   — key generation, regeneration and revocation, subscription suspension,

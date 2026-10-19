@@ -236,7 +236,7 @@ registered with the API Portal subscriber
 
 ### Updating dependencies
 
-Run these from `subscription-mediator/`. First see what is out of date:
+Run these from `src/`. First see what is out of date:
 
 ```bash
 go list -m -u all | grep '\['        # module, current version, [newest version]
@@ -274,7 +274,7 @@ Then rebuild the image (`make build`) to check the Docker build too.
 [`.github/workflows/subscription-mediator-dev.yaml`](../.github/workflows/subscription-mediator-dev.yaml)
 publishes a multi-arch image (linux/amd64, linux/arm64) to the **dev** Docker
 repository in JFrog Artifactory. It only runs for changes under
-`subscription-mediator/`:
+`src/`:
 
 | Event | What runs |
 |---|---|
@@ -450,7 +450,7 @@ Then make sure Actions is enabled. On a fork it is off until you open the
 ### 3. First run and checks
 
 Start it from **Actions → subscription-mediator (dev) → Run workflow** on `main`,
-or push a change under `subscription-mediator/`. When it finishes, the run
+or push a change under `src/`. When it finishes, the run
 summary lists the digest and the tags. Then check the registry:
 
 ```bash
@@ -474,7 +474,7 @@ curl -H "Authorization: Bearer <token>" \
 | `denied` on push | The CI user lacks Deploy/Cache on the repository, or the repo key in `DEV_REGISTRY` is wrong. |
 | The first push works, but the next fails on the `dev` tag | The CI user lacks Delete/Overwrite, so the moving `dev` tag can't be replaced. |
 | The login or push times out | Artifactory isn't reachable from GitHub-hosted runners (private network or IP allow-list). Use a self-hosted runner inside that network. |
-| *Check go.mod and go.sum are tidy* fails | Run `go mod tidy` in `subscription-mediator/` and commit the result. |
+| *Check go.mod and go.sum are tidy* fails | Run `go mod tidy` in `src/` and commit the result. |
 | *govulncheck* fails | A reachable vulnerability: often the Go standard library. Raise `go` in `go.mod` and the `golang:` tag in the Dockerfile to the fixed release. Both must move together, and setup-go follows `go.mod`. |
 
 ### Publishing from a workstation

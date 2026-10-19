@@ -32,11 +32,11 @@ on:
   push:
     branches: [main]
     paths:
-      - "subscription-mediator/**"
+      - "src/**"
       - ".github/workflows/subscription-mediator-dev.yaml"
   pull_request:
     paths:
-      - "subscription-mediator/**"
+      - "src/**"
       - ".github/workflows/subscription-mediator-dev.yaml"
   workflow_dispatch:
 
@@ -56,7 +56,7 @@ env:
 
 defaults:
   run:
-    working-directory: subscription-mediator
+    working-directory: src
 
 jobs:
   verify:
@@ -70,8 +70,8 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: subscription-mediator/go.mod
-          cache-dependency-path: subscription-mediator/go.sum
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
 
       - name: Check go.mod and go.sum are tidy
         run: |
@@ -111,7 +111,7 @@ jobs:
       - name: Build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: subscription-mediator
+          context: src
           platforms: ${{ env.PLATFORMS }}
           push: false
           cache-from: type=gha,scope=subscription-mediator
@@ -203,7 +203,7 @@ jobs:
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: subscription-mediator
+          context: src
           platforms: ${{ env.PLATFORMS }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}

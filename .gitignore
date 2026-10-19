@@ -4,10 +4,10 @@
 !*.env.example
 
 # Local mediator state, if it is ever run outside Docker.
-subscription-mediator/data/
+src/data/
 
 # Build output
-subscription-mediator/bin/
+src/bin/
 *.exe
 
 # Editor / OS
