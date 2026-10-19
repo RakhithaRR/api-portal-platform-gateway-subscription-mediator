@@ -272,119 +272,150 @@ Then rebuild the image (`make build`) to check the Docker build too.
 ## Publishing the image
 
 [`.github/workflows/subscription-mediator-dev.yaml`](../.github/workflows/subscription-mediator-dev.yaml)
-publishes a multi-arch image (linux/amd64, linux/arm64) to the **dev** Azure
-Container Registry. It only runs for changes under `subscription-mediator/`:
+publishes a multi-arch image (linux/amd64, linux/arm64) to the **dev** Docker
+repository in JFrog Artifactory. It only runs for changes under
+`subscription-mediator/`:
 
 | Event | What runs |
 |---|---|
-| Pull request | `go mod tidy` check, `go vet`, `go test -race`, `govulncheck`, then a multi-arch image build that is **not** pushed. No Azure access. |
-| Push to `main` | The same checks, then build and push to ACR |
+| Pull request | `go mod tidy` check, `go vet`, `go test -race`, `govulncheck`, then a multi-arch image build that is **not** pushed. No registry access. |
+| Push to `main` | The same checks, then build and push to Artifactory |
 | Manual run (*Run workflow*) | Same as a push to `main`, for the chosen branch |
 
-Each push to ACR carries two tags:
+The image is `<DEV_REGISTRY>/subscription-mediator`. Each push carries two tags:
 
 - `sha-<short commit>`: never moves. Deploy by this tag or by the digest
   printed in the run summary.
-- `dev`: moves to the newest build from `main`.
+- `dev`: moves to the newest build from `main`. Because it is overwritten, the
+  CI user needs **Delete/Overwrite** on the repository.
 
 Every image also carries an SBOM and build provenance. The workflow never pushes
 `:latest`.
 
-The workflow signs in to Azure with **OIDC federation**. GitHub hands the run a
-short-lived token that names the repository and the environment the job runs
-in. Azure trusts that token for one managed identity, and that identity may only
-push to the one registry. No password or client secret exists anywhere, so
-there is nothing to leak or rotate.
+The publish job runs in the GitHub environment `dev` and signs in to
+Artifactory with **OIDC**. GitHub hands the run a short-lived token that names
+the repository and the environment the job runs in. `jfrog/setup-jfrog-cli`
+exchanges it, through an OpenID Connect integration in Artifactory, for a
+short-lived Artifactory token for one CI user, and `docker/login-action` uses
+that token to sign in to the registry host. The CI user may only write to the
+one repository. No password is stored anywhere, so there is nothing to leak or
+rotate. Where OIDC can't be set up, a scoped access token works instead (see
+[Access token instead of OIDC](#access-token-instead-of-oidc)).
 
-The setup is done once, in Azure and then in GitHub.
+The setup is done once, in Artifactory and then in GitHub.
 
 ### Before you start
 
-- The Azure CLI, signed in (`az login`) to the subscription that holds the
-  registry.
-- On the resource group: **Contributor** or **Managed Identity Contributor**,
-  to create the identity.
-- On the registry: **Owner**, **User Access Administrator** or **Role Based
-  Access Control Administrator**, to grant it roles.
+- An Artifactory **admin** (or a project admin with rights to create users,
+  permissions and OIDC integrations).
 - **Admin** on the GitHub repository, to create the environment.
-
-### 1. Azure: create the identity and let it push
-
-Fill in the first five values. `REPO` must be the repository the workflow
-**runs in**. A fork, and the repository it was forked from, each need their own
-federated credential.
+- The values below. `DEV_REGISTRY` is the image prefix, without a scheme:
+  `<artifactory host>/<docker repo key>[/<path>]` with the repository-path
+  method (e.g. `mycompany.jfrog.io/docker-dev/api-platform`), or
+  `<repo key>.<host>/<path>` with the subdomain method.
 
 ```bash
-RG=<resource-group>                 # where the identity will live
-ACR=<registry-name>                 # without .azurecr.io
-REPO=<owner>/<repo>                 # e.g. RakhithaRR/api-portal-platform-gateway-subscription-mediator
-ENVIRONMENT=dev                     # the GitHub environment the publish job uses
-IDENTITY=subscription-mediator-ci
-
-# A user-assigned managed identity for the workflow
-az identity create -g "$RG" -n "$IDENTITY"
-PRINCIPAL_ID=$(az identity show -g "$RG" -n "$IDENTITY" --query principalId -o tsv)
-ACR_ID=$(az acr show -n "$ACR" --query id -o tsv)
-
-# AcrPush lets it push images; Reader on the registry lets `az acr login` find
-# the registry through Azure Resource Manager. Both apply to this registry only.
-for role in AcrPush Reader; do
-  az role assignment create --role "$role" --scope "$ACR_ID" \
-    --assignee-object-id "$PRINCIPAL_ID" --assignee-principal-type ServicePrincipal
-done
-
-# Trust GitHub's OIDC tokens, but only for jobs in the `dev` environment of REPO
-az identity federated-credential create -g "$RG" --identity-name "$IDENTITY" \
-  -n "github-${ENVIRONMENT}" \
-  --issuer https://token.actions.githubusercontent.com \
-  --subject "repo:${REPO}:environment:${ENVIRONMENT}" \
-  --audiences api://AzureADTokenExchange
-
-# The three IDs GitHub needs in step 2
-az identity show -g "$RG" -n "$IDENTITY" --query clientId -o tsv    # AZURE_CLIENT_ID
-az account show --query tenantId -o tsv                              # AZURE_TENANT_ID
-az account show --query id -o tsv                                    # AZURE_SUBSCRIPTION_ID
+JFROG_URL=https://mycompany.jfrog.io   # Artifactory base URL
+REPO_KEY=docker-dev                    # local Docker repository
+DEV_REGISTRY=mycompany.jfrog.io/docker-dev/api-platform
+REPO=<owner>/<repo>                    # e.g. RakhithaRR/api-portal-platform-gateway-subscription-mediator
+CI_USER=subscription-mediator-ci
+PROVIDER=github-subscription-mediator  # name of the OIDC integration
 ```
 
-The subject has to match exactly. It is case-sensitive, and it changes if the
-repository is renamed or transferred, or if the job's environment is renamed.
+`REPO` must be the repository the workflow **runs in**. A fork, and the
+repository it was forked from, each need their own identity mapping.
 
-If the registry's *Role assignment permissions mode* is **RBAC Registry + ABAC
-Repository Permissions**, AcrPush has no effect. Assign **Container Registry
-Repository Writer** instead.
+### 1. Artifactory: the repository, the CI user and OIDC
+
+1. **Repository.** Use an existing **local** Docker repository, or create one
+   (*Administration → Repositories → Create a Repository → Local → Docker*)
+   with the key `$REPO_KEY`.
+2. **CI user.** Create `$CI_USER` and a permission that gives it **Read**,
+   **Annotate**, **Deploy/Cache** and **Delete/Overwrite** on that repository
+   only. Delete/Overwrite is what lets each run move the `dev` tag.
+3. **OIDC integration.** *Administration → General Management → Manage
+   Integrations → New Integration → OpenID Connect*: provider type **GitHub**,
+   name `$PROVIDER`, provider URL `https://token.actions.githubusercontent.com`.
+   The audience is optional; if you set one, `JFROG_OIDC_AUDIENCE` in step 2
+   must be the same value.
+4. **Identity mapping.** On that integration, add a mapping whose claims match
+   this repository's publish job. The job runs in the `dev` environment, so
+   use `{"repository": "<owner>/<repo>", "environment": "dev"}`. Set the token
+   scope to the CI user, and a short expiry (e.g. 10 minutes).
+
+The same steps through the REST API, with an admin token in `$ADMIN_TOKEN`:
+
+```bash
+curl -fsS -X POST "$JFROG_URL/access/api/v1/oidc" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"name\": \"$PROVIDER\", \"issuer_url\": \"https://token.actions.githubusercontent.com\",
+       \"provider_type\": \"GitHub\", \"description\": \"subscription-mediator CI\"}"
+
+curl -fsS -X POST "$JFROG_URL/access/api/v1/oidc/$PROVIDER/identity_mappings" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"name\": \"$PROVIDER-dev\", \"priority\": 1,
+       \"claims\": {\"repository\": \"$REPO\", \"environment\": \"dev\"},
+       \"token_spec\": {\"username\": \"$CI_USER\",
+                        \"scope\": \"applied-permissions/user\",
+                        \"expires_in\": 600}}"
+```
+
+Field names can differ slightly between Artifactory versions; check them
+against what the UI shows.
+
+The claims have to match exactly. They are case-sensitive, and they change if
+the repository is renamed or transferred, or if the job's environment is
+renamed.
+
+#### Access token instead of OIDC
+
+Create an access token for the CI user (*Administration → User Management →
+Access Tokens*, or the REST API below), and set `JFROG_USERNAME` and the
+`JFROG_ACCESS_TOKEN` secret in step 2 instead of `JFROG_OIDC_PROVIDER`. Leave
+`JFROG_OIDC_PROVIDER` unset: when it is set, the workflow uses OIDC. Rotate the
+token before it expires.
+
+```bash
+curl -fsS -X POST "$JFROG_URL/access/api/v1/tokens" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d username="$CI_USER" -d scope=applied-permissions/user -d expires_in=7776000
+```
 
 ### 2. GitHub: the `dev` environment
 
 In the repository, open **Settings → Environments → New environment** and name it
-`dev`. That name must match `ENVIRONMENT` above and `environment: dev` in the
-workflow.
+`dev`. That name must match the `environment` claim in the identity mapping and
+`environment: dev` in the workflow.
 
 - **Deployment branches and tags:** choose *Selected branches and tags* and add
   `main`. Any job can claim `environment: dev`, so this rule is what stops a
   manual run from another branch from pushing to the registry.
-- **Environment secrets:**
-
-  | Name | Value |
-  |---|---|
-  | `AZURE_CLIENT_ID` | the identity's client ID |
-  | `AZURE_TENANT_ID` | the Entra tenant ID |
-  | `AZURE_SUBSCRIPTION_ID` | the subscription that holds the registry |
-
-  None of these is a credential: without a GitHub token that matches the
-  federated credential, they get nobody into Azure. They are secrets so they are
-  masked in the run logs, which anyone can read on a public repository. Add them
-  to the **environment**, not the repository, so only the publish job can read
-  them.
 - **Environment variables:**
 
   | Name | Value |
   |---|---|
-  | `ACR_NAME` | the registry name, without `.azurecr.io` |
+  | `DEV_REGISTRY` | `<artifactory host>/<docker repo key>[/<path>]`, no scheme |
+  | `JFROG_URL` | the Artifactory base URL, e.g. `https://mycompany.jfrog.io` |
+  | `JFROG_OIDC_PROVIDER` | the OIDC integration's name (OIDC sign-in) |
+  | `JFROG_OIDC_AUDIENCE` | optional; only if the integration has an audience |
+  | `JFROG_USERNAME` | access-token sign-in only: the CI user |
 
-  This one is a variable because it is part of every image reference the run
+  These are variables because they are part of every image reference the run
   prints. A secret would mask the tags and the summary as `***`.
+- **Environment secrets** (access-token sign-in only):
+
+  | Name | Value |
+  |---|---|
+  | `JFROG_ACCESS_TOKEN` | the CI user's scoped access token |
+
+  Add it to the **environment**, not the repository, so only the publish job
+  can read it.
 - **Optional:** *Required reviewers*, to have each push to the registry approved
   by a person.
+
+The workflow checks these settings first and fails with a message that names
+what is missing.
 
 The same settings from the command line, if you prefer:
 
@@ -393,10 +424,24 @@ gh api -X PUT "repos/$REPO/environments/dev" \
   -F "deployment_branch_policy[protected_branches]=false" \
   -F "deployment_branch_policy[custom_branch_policies]=true"
 gh api -X POST "repos/$REPO/environments/dev/deployment-branch-policies" -f name=main
-gh secret set AZURE_CLIENT_ID       --env dev --repo "$REPO" --body "<client-id>"
-gh secret set AZURE_TENANT_ID       --env dev --repo "$REPO" --body "<tenant-id>"
-gh secret set AZURE_SUBSCRIPTION_ID --env dev --repo "$REPO" --body "<subscription-id>"
-gh variable set ACR_NAME            --env dev --repo "$REPO" --body "<registry-name>"
+gh variable set DEV_REGISTRY        --env dev --repo "$REPO" --body "$DEV_REGISTRY"
+gh variable set JFROG_URL           --env dev --repo "$REPO" --body "$JFROG_URL"
+gh variable set JFROG_OIDC_PROVIDER --env dev --repo "$REPO" --body "$PROVIDER"
+# gh variable set JFROG_OIDC_AUDIENCE --env dev --repo "$REPO" --body "<audience>"
+
+# Access token instead of OIDC:
+# gh variable set JFROG_USERNAME --env dev --repo "$REPO" --body "$CI_USER"
+# gh secret set JFROG_ACCESS_TOKEN --env dev --repo "$REPO" --body "<token>"
+```
+
+If the environment still has the settings from the earlier Azure Container
+Registry setup, remove them:
+
+```bash
+for s in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID; do
+  gh secret delete "$s" --env dev --repo "$REPO"
+done
+gh variable delete ACR_NAME --env dev --repo "$REPO"
 ```
 
 Then make sure Actions is enabled. On a fork it is off until you open the
@@ -409,31 +454,37 @@ or push a change under `subscription-mediator/`. When it finishes, the run
 summary lists the digest and the tags. Then check the registry:
 
 ```bash
-az acr repository show-tags -n "$ACR" --repository subscription-mediator -o table
-docker buildx imagetools inspect "$ACR.azurecr.io/subscription-mediator:dev"   # linux/amd64 and linux/arm64
+docker buildx imagetools inspect "$DEV_REGISTRY/subscription-mediator:dev"   # linux/amd64 and linux/arm64
+
+# or list the tags (<path> is the part of DEV_REGISTRY after the repo key)
+curl -H "Authorization: Bearer <token>" \
+  "$JFROG_URL/artifactory/api/docker/$REPO_KEY/v2/<path>/subscription-mediator/tags/list"
 ```
 
 ### When it fails
 
 | Symptom | Cause and fix |
 |---|---|
-| `AADSTS700213` / *No matching federated identity record found* | The subject doesn't match. It must be `repo:<owner>/<repo>:environment:dev`, with the owner and repository the run belongs to: check for a fork, a rename or a transfer. |
+| *Check registry settings* fails | A variable or secret is missing, or `DEV_REGISTRY` has a scheme or no repo key. The message names it. Check the settings are on the `dev` environment, not the repository. |
+| The OIDC exchange fails: no identity mapping matched | The claims don't match. `repository` must be `<owner>/<repo>` of the repository the run belongs to, in exact case (check for a fork, a rename or a transfer), and `environment` must be `dev`: the job must run in the `dev` environment. |
+| The OIDC exchange fails on the audience | `JFROG_OIDC_AUDIENCE` and the integration's audience differ. Set both to the same value, or neither. |
+| `Unable to get ACTIONS_ID_TOKEN_REQUEST_URL` | The job has no `id-token: write` permission, or the run is from a fork's pull request, which never gets an OIDC token. |
 | The publish job waits, or says the branch is not allowed to deploy | The `dev` environment's branch rule doesn't include the branch you ran from. |
-| `Login failed` before any Azure call, with an empty client-id or tenant-id | The secrets are on the repository or another environment, not on `dev`, or their names are misspelt. |
-| `az acr login` can't find the registry | `ACR_NAME` is missing or includes `.azurecr.io`, or the identity lacks Reader on the registry. |
-| `denied` / `unauthorized` on push | AcrPush is missing. A new role assignment can take a few minutes to apply, so re-run once. On an ABAC-mode registry, see step 1. |
-| The push can't reach the registry | The registry allows only private endpoints or selected networks. GitHub-hosted runners can't reach it, so use a self-hosted runner inside that network. |
+| `unauthorized` on `docker login` | `DEV_REGISTRY`'s host is not the Artifactory registry host, or the access token has expired. |
+| `denied` on push | The CI user lacks Deploy/Cache on the repository, or the repo key in `DEV_REGISTRY` is wrong. |
+| The first push works, but the next fails on the `dev` tag | The CI user lacks Delete/Overwrite, so the moving `dev` tag can't be replaced. |
+| The login or push times out | Artifactory isn't reachable from GitHub-hosted runners (private network or IP allow-list). Use a self-hosted runner inside that network. |
 | *Check go.mod and go.sum are tidy* fails | Run `go mod tidy` in `subscription-mediator/` and commit the result. |
 | *govulncheck* fails | A reachable vulnerability: often the Go standard library. Raise `go` in `go.mod` and the `golang:` tag in the Dockerfile to the fixed release. Both must move together, and setup-go follows `go.mod`. |
 
 ### Publishing from a workstation
 
-The Makefile does the same build by hand, signed in as yourself rather than as
-the identity:
+The Makefile does the same build by hand, signed in as yourself (or as the CI
+user with its token) rather than through OIDC:
 
 ```bash
-az acr login --name "$ACR"
-make build-and-push-multiarch DOCKER_REGISTRY="$ACR.azurecr.io" VERSION=<x.y.z>
+docker login mycompany.jfrog.io      # the Artifactory host
+make build-and-push-multiarch DOCKER_REGISTRY="$DEV_REGISTRY" VERSION=<x.y.z>
 ```
 
 This pushes `:<x.y.z>` and `:latest`; add `PUSH_LATEST=false` to keep `:latest`
@@ -752,16 +803,21 @@ gateway-side fix.
 
 ## How a portal API is matched to a gateway API
 
-The portal sends `api.ref_id` — a Platform API UUID your gateway has never seen,
-because its APIs came from API Manager. So matching is on display name and
-version, tried in this order:
+The portal sends `api.ref_id`, the listing's `spec.referenceId`. A publisher
+that knows the gateway API sets it to that API's name (`metadata.name`); the API
+catalog always does. Matching is tried in this order:
 
 1. An `[api_handles]` entry in `configs/config.toml`.
 2. A resolution from the last five minutes, kept in memory.
-3. `GET /rest-apis?displayName=<name>&version=<version>` — the exact match.
-4. A scan of the full list, folding case, spacing and punctuation, so
-   `Order API` matches `order-api`, `OrderAPI` or `Order-API`.
+3. **The gateway API named exactly `api.ref_id`.** This is authoritative: an API
+   that merely shares the display name and version can't take its place.
+4. `GET /rest-apis?displayName=<name>&version=<version>`, the exact name match.
 5. The gateway's own handle convention, `<slugified-name>-<version>`.
+6. A scan of the full list, folding case, spacing and punctuation, so
+   `Order API` matches `order-api`, `OrderAPI` or `Order-API`.
+
+Steps 4–6 are the fallback for a listing without a `ref_id`, or whose `ref_id`
+names nothing on the gateway (for example a Platform API UUID).
 
 Versions aren't guessed at: portal `v1.0` against gateway `1.0.0` doesn't match,
 because those are different versions. When nothing resolves, the delivery fails

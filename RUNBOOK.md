@@ -9,7 +9,7 @@ document is the *what to do*.
 |---|---|
 | Service | `subscription-mediator`: bridges API Portal 1.0.0 webhooks to the API Platform Gateway management API. Needs a gateway controller that includes [wso2/api-platform#3804](https://github.com/wso2/api-platform/pull/3804) (issue [#3782](https://github.com/wso2/api-platform/issues/3782)): `POST /subscriptions` with an `externalRefId` that becomes the subscription's `id`, and a partial `PUT /subscriptions/{id}`. Stock 1.2.0 does not; `thivindu/gateway-controller:1.2.0.17-SNAPSHOT` does (the base controller image of the custom gateway build) |
 | Environment | dev (AKS) |
-| Image | `<registry>.azurecr.io/subscription-mediator`, tags `sha-<commit>` and `dev` |
+| Image | `<DEV_REGISTRY>/subscription-mediator` in JFrog Artifactory (e.g. `mycompany.jfrog.io/docker-dev/api-platform/subscription-mediator`), tags `sha-<commit>` and `dev` |
 | Kubernetes | namespace `subscription-mediator`, Helm release `subscription-mediator`, Deployment `subscription-mediator` (2 replicas), no volumes |
 | Owner / on-call | `<team>` / `<on-call rota or channel>` |
 | Escalation | API Portal: `<contact>` · API Platform Gateway: `<contact>` · AKS / Azure: `<contact>` |
@@ -20,7 +20,8 @@ The commands below assume:
 NS=subscription-mediator
 RELEASE=subscription-mediator
 CHART=subscription-mediator/deploy/helm/subscription-mediator
-ACR=<registry-name>                      # without .azurecr.io
+DEV_REGISTRY=<artifactory host>/<docker repo key>[/<path>]   # no scheme, e.g. mycompany.jfrog.io/docker-dev/api-platform
+JFROG_URL=https://<artifactory host>                     # e.g. https://mycompany.jfrog.io
 PODS="app.kubernetes.io/name=subscription-mediator,app.kubernetes.io/instance=$RELEASE"
 ```
 
@@ -29,7 +30,7 @@ PODS="app.kubernetes.io/name=subscription-mediator,app.kubernetes.io/instance=$R
 ## 1. How it fits together
 
 ```
- developer ── PR ──▶ GitHub Actions ── push to main ──▶ ACR  <registry>.azurecr.io/subscription-mediator:sha-<commit>
+ developer ── PR ──▶ GitHub Actions ── push to main ──▶ Artifactory  <DEV_REGISTRY>/subscription-mediator:sha-<commit>
                      (vet, test, govulncheck,                     │
                       multi-arch build)                           │ helm upgrade --set image.tag=sha-<commit>
                                                                   ▼
@@ -69,9 +70,9 @@ instructions.
 
 | # | Step | Detail | Done when |
 |---|---|---|---|
-| 1 | Create the managed identity, give it AcrPush and Reader on the registry, and add the GitHub federated credential | [mediator README → Publishing the image, step 1](subscription-mediator/README.md#1-azure-create-the-identity-and-let-it-push) | `az identity federated-credential list` shows the `repo:<owner>/<repo>:environment:dev` subject |
-| 2 | Create the GitHub `dev` environment: limit it to the `main` branch, and add three secrets and one variable | [step 2](subscription-mediator/README.md#2-github-the-dev-environment) | A manual run of the workflow pushes an image ([§3.2](#32-confirm-the-image-was-published)) |
-| 3 | Let AKS pull from ACR | `az aks update -g <rg> -n <cluster> --attach-acr $ACR` | `az aks check-acr -g <rg> -n <cluster> --acr $ACR.azurecr.io` passes |
+| 1 | In Artifactory: pick the local Docker repository, create the CI user with Read, Annotate, Deploy/Cache and Delete/Overwrite on it, and add the GitHub OIDC integration with an identity mapping for this repository's `dev` environment | [mediator README → Publishing the image, step 1](subscription-mediator/README.md#1-artifactory-the-repository-the-ci-user-and-oidc) | The integration lists a mapping with claims `{"repository": "<owner>/<repo>", "environment": "dev"}` scoped to the CI user |
+| 2 | Create the GitHub `dev` environment: limit it to the `main` branch, and set `DEV_REGISTRY`, `JFROG_URL` and `JFROG_OIDC_PROVIDER` (or `JFROG_USERNAME` and the `JFROG_ACCESS_TOKEN` secret) | [step 2](subscription-mediator/README.md#2-github-the-dev-environment) | A manual run of the workflow pushes an image ([§3.2](#32-confirm-the-image-was-published)) |
+| 3 | Let AKS pull from Artifactory: a pull-only user or token (Read on the repository) and an image pull secret, referenced from the values file as `imagePullSecrets: [{name: artifactory-pull}]` | `kubectl -n $NS create secret docker-registry artifactory-pull --docker-server=<artifactory host> --docker-username=<user> --docker-password=<token>` | `kubectl -n $NS get secret artifactory-pull` |
 | 4 | Create a gateway user with the **admin** role for the mediator | The gateway's user configuration | `curl -u user:pass <gateway>/api/management/v1/subscription-plans` returns 200 |
 | 5 | Generate the webhook secret | `openssl rand -base64 48` | Stored in Key Vault (or your secret store) |
 | 6 | Create the namespace and credentials Secret | [chart README → Credentials](subscription-mediator/deploy/helm/subscription-mediator/README.md#1-credentials) | `kubectl -n $NS get secret subscription-mediator-credentials` |
@@ -151,8 +152,10 @@ If CI fails, use the table in
 
 ```bash
 TAG=sha-<commit>
-az acr repository show-tags -n $ACR --repository subscription-mediator --orderby time_desc --top 5 -o table
-docker buildx imagetools inspect $ACR.azurecr.io/subscription-mediator:$TAG   # must list linux/amd64 and linux/arm64
+docker buildx imagetools inspect $DEV_REGISTRY/subscription-mediator:$TAG   # must list linux/amd64 and linux/arm64
+# or list the tags (<repo-key> and <path> are the parts of DEV_REGISTRY after the host)
+curl -H "Authorization: Bearer <token>" \
+  "$JFROG_URL/artifactory/api/docker/<repo-key>/v2/<path>/subscription-mediator/tags/list"
 ```
 
 ### 3.3 Deploy to the cluster
@@ -336,7 +339,7 @@ kubectl -n $NS logs -l $PODS --tail=100 --prefix          # add --previous after
 |---|---|---|
 | `CrashLoopBackOff`, last log names a setting (e.g. `[webhook] secret is required`) | Missing or invalid config or credentials | Fix the Secret or the values, then restart or `helm upgrade` |
 | `CreateContainerConfigError` | The Secret, or a key in it, doesn't exist | `kubectl -n $NS get secret subscription-mediator-credentials -o jsonpath='{.data}' \| jq keys`. The keys must match `secret.keys.*` |
-| `ImagePullBackOff` | Wrong tag, or AKS can't pull from ACR | Check the tag exists ([§3.2](#32-confirm-the-image-was-published)). Run `az aks check-acr` |
+| `ImagePullBackOff` | Wrong tag, or the image pull secret is missing or invalid | Check the tag exists ([§3.2](#32-confirm-the-image-was-published)). Check `kubectl -n $NS get secret artifactory-pull`, that `imagePullSecrets` names it, and that its token is valid |
 | `Pending`, *Insufficient cpu/memory* | No node has room for the pod | Add capacity, or lower `resources.requests` |
 | Startup probe failures, killed after ~60 s | The process is stuck before it listens | Check the logs. Raise `startupProbe.failureThreshold` only after you understand why |
 
@@ -451,6 +454,6 @@ helm -n $NS list
 | Need | Where |
 |---|---|
 | How the mediator works, its config, endpoints and delivery semantics | [subscription-mediator/README.md](subscription-mediator/README.md) |
-| CI and ACR setup, and CI failures | [README → Publishing the image](subscription-mediator/README.md#publishing-the-image) |
+| CI and Artifactory setup, and CI failures | [README → Publishing the image](subscription-mediator/README.md#publishing-the-image) |
 | Chart values and design | [deploy/helm/subscription-mediator/README.md](subscription-mediator/deploy/helm/subscription-mediator/README.md) |
 | The full demo flow (gateway, APIM, portal) | [README.md](README.md) |

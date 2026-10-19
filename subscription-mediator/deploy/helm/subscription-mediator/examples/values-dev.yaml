@@ -9,9 +9,14 @@
 #   kubectl get pods -A --show-labels
 
 image:
-  repository: <registry>.azurecr.io/subscription-mediator
+  repository: <artifactory-host>/<docker-repo-key>/<path>/subscription-mediator
   # Set per deploy with --set image.tag=sha-<commit>, or pin a digest.
   tag: ""
+
+# docker-registry Secret holding a pull-only Artifactory user or token; see the
+# chart README, "Image pull".
+imagePullSecrets:
+  - name: artifactory-pull
 
 config:
   gateway:

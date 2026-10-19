@@ -73,7 +73,7 @@ agent-verification.md       an end-to-end test script for a coding agent —
 subscription-mediator/      the bridge itself — Go, runs in Docker
                             (see its own README for internals and operations)
 .github/workflows/          CI: tests the mediator and publishes its image to
-                            the dev Azure Container Registry (setup: the
+                            the dev Docker repository in JFrog Artifactory (setup: the
                             mediator README, "Publishing the image")
 resources/                  the sample APIs (see resources/README.md)
   echo-api/                 a trivial httpbin-backed API

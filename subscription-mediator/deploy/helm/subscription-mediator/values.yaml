@@ -8,7 +8,9 @@ nameOverride: ""
 fullnameOverride: ""
 
 image:
-  # Registry and repository, e.g. myregistry.azurecr.io/subscription-mediator.
+  # Registry and repository, e.g.
+  # mycompany.jfrog.io/docker-dev/api-platform/subscription-mediator
+  # (<artifactory host>/<docker repo key>/<path>/subscription-mediator).
   repository: ""
   # Pin an immutable tag: the sha-<commit> tag CI pushes. A moving tag such as
   # `dev` lets a pod restart silently pick up a different build.
@@ -18,10 +20,13 @@ image:
   digest: ""
   pullPolicy: IfNotPresent
 
-# Only needed when the cluster cannot already pull from the registry. On AKS,
-# prefer `az aks update --attach-acr <registry>` and leave this empty.
+# Needed when the registry requires sign-in, as the Artifactory Docker
+# repository does. Create a docker-registry Secret from a pull-only user or
+# token (Read on the repository) in the release namespace:
+#   kubectl -n <ns> create secret docker-registry artifactory-pull \
+#     --docker-server=<artifactory host> --docker-username=<user> --docker-password=<token>
 imagePullSecrets: []
-#  - name: acr-pull
+#  - name: artifactory-pull
 
 # --- Configuration ----------------------------------------------------------
 # Rendered into config.toml in a ConfigMap. Credentials never go here; see

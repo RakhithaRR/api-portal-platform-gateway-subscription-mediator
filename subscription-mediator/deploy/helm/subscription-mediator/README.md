@@ -56,13 +56,21 @@ The default key names are `webhook-secret`, `gateway-username` and
 
 ### 2. Image pull
 
-On AKS, let the cluster pull from the registry directly:
+The image lives in a Docker repository in JFrog Artifactory, which requires
+sign-in. Create a pull-only Artifactory user or access token (Read on the
+repository), store it in a docker-registry Secret, and list that Secret in
+`imagePullSecrets`:
 
 ```bash
-az aks update -g <rg> -n <cluster> --attach-acr <registry>
+kubectl -n subscription-mediator create secret docker-registry artifactory-pull \
+  --docker-server=<artifactory host> \
+  --docker-username=<user> --docker-password=<token>
 ```
 
-Elsewhere, create a docker-registry Secret and list it in `imagePullSecrets`.
+```yaml
+imagePullSecrets:
+  - name: artifactory-pull
+```
 
 ### 3. Install
 
@@ -164,7 +172,8 @@ values at install time. The ones most installs set:
 
 | Value | Default | Purpose |
 |---|---|---|
-| `image.repository` | `""` | e.g. `myregistry.azurecr.io/subscription-mediator` |
+| `image.repository` | `""` | e.g. `mycompany.jfrog.io/docker-dev/api-platform/subscription-mediator` |
+| `imagePullSecrets` | `[]` | the docker-registry Secret for Artifactory, e.g. `[{name: artifactory-pull}]` |
 | `image.tag` / `image.digest` | `""` | the build to run. A digest wins over a tag. |
 | `config.gateway.baseUrl` | `""` | Gateway Controller management API URL: `http://…:9090/api/management/v1`, or `https://…` for a TLS-terminating proxy in front of it |
 | `config.gateway.ca.secretName` / `.configMapName` | `""` | the TLS proxy's CA, when self-signed or private; one of the two. `https` only |

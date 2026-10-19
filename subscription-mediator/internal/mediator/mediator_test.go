@@ -1284,3 +1284,64 @@ func TestSubscriptionUpdateSendsOnlyTheSetFields(t *testing.T) {
 		}
 	}
 }
+
+// --- API resolution --------------------------------------------------------
+
+// subscribeTo sends a subscription.created for a portal API reference.
+func subscribeTo(t *testing.T, id string, api map[string]any) []byte {
+	return buildEvent(t, id, webhook.EventSubscriptionCreated, map[string]any{
+		"subscription_id": "portal-sub-" + id, "subscriber_id": "dev@example.com", "status": "ACTIVE",
+		"subscription_plan": map[string]string{"ref_id": "portal-plan-gold", "name": "Gold"},
+		"api":               api, "token": encryptField(t, testToken+"-"+id),
+	}, "token")
+}
+
+// TestRefIDWinsOverAMatchingDisplayName: the listing's ref_id names the gateway
+// API exactly, so another gateway API that shares the portal's display name and
+// version must not take the subscription.
+func TestRefIDWinsOverAMatchingDisplayName(t *testing.T) {
+	fake := newFakeGateway()
+	fake.addAPI("Order API", "v1.0", "someone-elses-order-api-v1-0") // display name matches the portal's
+	fake.addAPI("OrderAPI", "v1.0", "OrderAPI-v1.0")                 // the API the listing points to
+	h := newHarness(t, fake, nil)
+
+	api := map[string]any{"ref_id": "OrderAPI-v1.0", "name": "Order API", "version": "v1.0", "type": "RestApi"}
+	if err := h.handle(t, subscribeTo(t, "evt-1", api)); err != nil {
+		t.Fatalf("Handle() = %v", err)
+	}
+	if sub, _ := fake.onlySub(t); sub.APIID != "OrderAPI-v1.0" {
+		t.Errorf("subscribed to %q, want the API the ref_id names", sub.APIID)
+	}
+}
+
+// TestUnknownRefIDFallsBackToNameAndVersion: a ref_id that names nothing on the
+// gateway (a listing published outside the catalog) still resolves by name.
+func TestUnknownRefIDFallsBackToNameAndVersion(t *testing.T) {
+	fake := newFakeGateway()
+	fake.addAPI("Order API", "v1.0", "order-api-v1.0")
+	h := newHarness(t, fake, nil)
+
+	api := map[string]any{"ref_id": "cp-api-1", "name": "Order API", "version": "v1.0", "type": "RestApi"}
+	if err := h.handle(t, subscribeTo(t, "evt-1", api)); err != nil {
+		t.Fatalf("Handle() = %v", err)
+	}
+	if sub, _ := fake.onlySub(t); sub.APIID != "order-api-v1.0" {
+		t.Errorf("subscribed to %q, want the name and version match", sub.APIID)
+	}
+}
+
+// TestRefIDResolvesWhenDisplayNamesDiffer: the portal's display name ("Air
+// Quality API") needn't resemble the gateway's ("AirQualityAPI").
+func TestRefIDResolvesWhenDisplayNamesDiffer(t *testing.T) {
+	fake := newFakeGateway()
+	fake.addAPI("AirQualityAPI", "v1.0", "AirQualityAPI-v1.0")
+	h := newHarness(t, fake, nil)
+
+	api := map[string]any{"ref_id": "AirQualityAPI-v1.0", "name": "Air Quality API", "version": "v1.0", "type": "RestApi"}
+	if err := h.handle(t, subscribeTo(t, "evt-1", api)); err != nil {
+		t.Fatalf("Handle() = %v", err)
+	}
+	if sub, _ := fake.onlySub(t); sub.APIID != "AirQualityAPI-v1.0" {
+		t.Errorf("subscribed to %q, want AirQualityAPI-v1.0", sub.APIID)
+	}
+}

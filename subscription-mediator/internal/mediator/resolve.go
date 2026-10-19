@@ -142,9 +142,29 @@ func (r *resolver) describeHandle(ctx context.Context, handle, cacheKey string) 
 }
 
 // search finds the gateway API matching a portal API reference.
+//
+// The listing's ref_id comes first: a publisher that knows the gateway API sets
+// it to that API's name (the API catalog always does), so an exact match on it
+// is authoritative and can't be confused with another API that happens to share
+// the display name and version. Name and version matching is the fallback, for
+// listings without a ref_id or whose ref_id names nothing on the gateway.
 func (r *resolver) search(ctx context.Context, ref *webhook.APIRef) (string, []string, error) {
 	name := strings.TrimSpace(ref.Name)
 	version := strings.TrimSpace(ref.Version)
+
+	if refID := strings.TrimSpace(ref.RefID); refID != "" {
+		apis, err := r.client.ListRestAPIs(ctx, "", "")
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to list the gateway's REST APIs: %w", err)
+		}
+		for i := range apis {
+			if strings.EqualFold(apis[i].Handle(), refID) || strings.EqualFold(apis[i].Metadata.Name, refID) {
+				return apis[i].Handle(), apis[i].Spec.SubscriptionPlans, nil
+			}
+		}
+		r.logger.Info("no gateway API is named after the listing's ref_id; matching by name and version",
+			slog.String("ref_id", refID), slog.String("portal_api", name+" "+version))
+	}
 
 	// The gateway filters on displayName and version directly — the exact match
 	// and the cheapest call.
@@ -184,10 +204,6 @@ func (r *resolver) search(ctx context.Context, ref *webhook.APIRef) (string, []s
 
 		// The gateway's own handle convention is "<slugified name>-<version>".
 		if wantName != "" && wantVersion != "" && strings.EqualFold(api.Handle(), slugify(name)+"-"+version) {
-			byHandle = append(byHandle, c)
-			continue
-		}
-		if ref.RefID != "" && strings.EqualFold(api.Handle(), ref.RefID) {
 			byHandle = append(byHandle, c)
 			continue
 		}

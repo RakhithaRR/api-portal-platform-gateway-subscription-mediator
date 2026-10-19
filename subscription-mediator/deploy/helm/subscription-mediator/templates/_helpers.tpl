@@ -49,7 +49,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{/* The image reference: repository@digest when a digest is set, else repository:tag. */}}
 {{- define "subscription-mediator.image" -}}
-{{- $repo := required "image.repository is required, e.g. myregistry.azurecr.io/subscription-mediator" .Values.image.repository }}
+{{- $repo := required "image.repository is required, e.g. mycompany.jfrog.io/docker-dev/api-platform/subscription-mediator" .Values.image.repository }}
 {{- if .Values.image.digest }}
 {{- printf "%s@%s" $repo .Values.image.digest }}
 {{- else }}
